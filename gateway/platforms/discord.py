@@ -2809,23 +2809,56 @@ class DiscordAdapter(BasePlatformAdapter):
     # Auto-thread helpers
     # ------------------------------------------------------------------
 
+    def _derive_auto_thread_name(self, content: str) -> str:
+        """Derive a compact, glanceable Discord auto-thread title.
+
+        Avoid using the user's first message verbatim; voice-input messages are
+        often long, and Discord's sidebar becomes hard to scan.  Keep this
+        deterministic and local (no LLM/API call in the hot message path).
+        """
+        text = (content or "").strip()
+        text = re.sub(r"<@[!&]?\d+>", "", text)
+        text = re.sub(r"<#\d+>", "", text)
+        text = re.sub(r"https?://\S+", "URL", text)
+        text = re.sub(r"\s+", " ", text).strip(" -—:：。.!?？")
+        if not text:
+            return "Hermes相談"
+
+        lower = text.lower()
+        buckets = [
+            ("Discord整理", ("discord", "スレ", "スレッド", "チャンネル", "thread")),
+            ("GitHub整理", ("github", "issue", "pull request", "pr", "リポジトリ")),
+            ("Hermes設定", ("hermes", "gateway", "cron", "config", "設定", "自動化")),
+            ("レシピ", ("レシピ", "料理", "献立", "食材")),
+            ("旅行", ("旅行", "宿", "ホテル", "交通", "おでかけ", "観光")),
+            ("YouTube", ("youtube", "動画", "視聴", "チャンネル")),
+            ("ニュース", ("ニュース", "記事", "調べ", "調査", "リサーチ")),
+            ("タスク整理", ("todo", "タスク", "やること", "予定", "リマインド")),
+            ("コード作業", ("コード", "実装", "修正", "バグ", "エラー", "テスト")),
+        ]
+        prefix = next((label for label, keys in buckets if any(k in lower for k in keys)), "相談")
+
+        # Prefer the first short clause/question rather than the full first turn.
+        snippet = re.sub(
+            r"^(ちょっと|なんか|えっと|あの|全体的に|念のため|できれば|可能なら|お願い|すみません|ごめん)[、,\s]*",
+            "",
+            text,
+        ).strip(" -—:：。.!?？")
+        snippet = re.split(r"[、,。！？!?\n]", snippet, maxsplit=1)[0]
+        if len(snippet) > 22:
+            snippet = snippet[:21].rstrip() + "…"
+
+        if not snippet or snippet == prefix:
+            return prefix
+        name = f"{prefix}: {snippet}"
+        return name[:80]
+
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 
         Returns the created thread object, or ``None`` on failure.
         """
-        # Build a short thread name from the message. Strip Discord mention
-        # syntax (users / roles / channels) so thread titles don't end up
-        # showing raw <@id>, <@&id>, or <#id> markers — the ID isn't
-        # meaningful to humans glancing at the thread list (#6336).
-        content = (message.content or "").strip()
-        # <@123>, <@!123>, <@&123>, <#123> — collapse to empty; normalize spaces.
-        content = re.sub(r"<@[!&]?\d+>", "", content)
-        content = re.sub(r"<#\d+>", "", content)
-        content = re.sub(r"\s+", " ", content).strip()
-        thread_name = content[:80] if content else "Hermes"
-        if len(content) > 80:
-            thread_name = thread_name[:77] + "..."
+        thread_name = self._derive_auto_thread_name(message.content or "")
 
         try:
             thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
@@ -3239,8 +3272,10 @@ class DiscordAdapter(BasePlatformAdapter):
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
             skip_thread = bool(channel_ids & no_thread_channels) or is_free_channel
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in ("true", "1", "yes")
-            is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
-            if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
+            # Auto-thread replies too. This lets a channel reply to cron/job output
+            # become its own isolated task thread instead of falling back to a
+            # direct channel response.
+            if auto_thread and not skip_thread and not is_voice_linked_channel:
                 thread = await self._auto_create_thread(message)
                 if thread:
                     parent_channel_id = str(message.channel.id)

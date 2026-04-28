@@ -75,6 +75,7 @@ class FakeThread:
 
 @pytest.fixture
 def adapter(monkeypatch):
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
     monkeypatch.setattr(discord_platform.discord, "DMChannel", FakeDMChannel, raising=False)
     monkeypatch.setattr(discord_platform.discord, "Thread", FakeThread, raising=False)
 
@@ -198,6 +199,23 @@ async def test_dms_unaffected_by_ignored_channels(adapter, monkeypatch):
     await adapter._handle_message(message)
 
     adapter.handle_message.assert_awaited_once()
+
+
+# ── auto thread naming ───────────────────────────────────────────────
+
+
+def test_auto_thread_name_is_compact_and_categorized(adapter):
+    name = adapter._derive_auto_thread_name(
+        "全体的に、スレを毎回立ててくれるのはいいんだけど、スレ名が毎回自分の一言目だから、長くなりがちで内容がちょっとよくわからないんだよね。"
+    )
+
+    assert name == "Discord整理: スレを毎回立ててくれるのはいいんだけど"
+    assert len(name) <= 80
+
+
+def test_auto_thread_name_strips_mentions_urls_and_falls_back(adapter):
+    assert adapter._derive_auto_thread_name("<@123> <#456> https://example.com") == "相談: URL"
+    assert adapter._derive_auto_thread_name("<@123>   ") == "Hermes相談"
 
 
 # ── no_thread_channels ───────────────────────────────────────────────
