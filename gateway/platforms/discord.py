@@ -2131,6 +2131,124 @@ class DiscordAdapter(BasePlatformAdapter):
         # Discord markdown is fairly standard, no special escaping needed
         return content
 
+    def _normalize_todo_issue(self, issue: str | None) -> str:
+        issue = (issue or "").strip()
+        if not issue:
+            return ""
+        return "#" + issue.lstrip("#")
+
+    def _build_todo_prompt(
+        self,
+        action: str,
+        *,
+        issue: str | None = None,
+        text: str | None = None,
+        target: str | None = None,
+    ) -> str:
+        action = (action or "today").strip().lower()
+        issue_ref = self._normalize_todo_issue(issue)
+        text = (text or "").strip()
+        target = (target or "").strip().lower()
+        if action == "today":
+            return "今日のTODOを見せて。Discord向けに短く、各項目にIssue番号を含めて。"
+        if action == "week":
+            return "今週のTODOを見せて。Next/Doing/Laterの棚ごとに短く整理して。"
+        if action == "shopping":
+            return "買い物リストを見せて。買った/あとで/詳細の操作がしやすい形で。"
+        if action == "later":
+            return "LaterのTODOを見せて。Nextへ上げる候補も短く提案して。"
+        if action == "create":
+            return f"TODO候補として確認カード前提で整理して: {text}"
+        if action == "view" and issue_ref:
+            return f"{issue_ref} のTODO詳細をDiscordカード向けに見せて。"
+        if action == "done" and issue_ref:
+            return f"Issue {issue_ref} のTODOを完了にして。"
+        if action == "move" and issue_ref:
+            target_label = {
+                "tomorrow": "明日へ",
+                "next-week": "来週へ",
+                "someday": "いつかへ",
+                "later": "Laterへ",
+                "doing": "Doingへ",
+            }.get(target, target or "指定先へ")
+            return f"Issue {issue_ref} のTODOを{target_label}送って。"
+        return "今日のTODOを見せて。Discord向けに短く、各項目にIssue番号を含めて。"
+
+    async def _dispatch_todo_text(self, interaction: discord.Interaction, prompt: str) -> None:
+        event = self._build_slash_event(interaction, prompt)
+        await self.handle_message(event)
+
+    def _build_todo_control_view(self, interaction: discord.Interaction):
+        adapter = self
+
+        class TodoControlView(discord.ui.View):
+            def __init__(self):
+                super().__init__(timeout=900)
+
+            async def _run(self, button_interaction: discord.Interaction, action: str, **kwargs) -> None:
+                await button_interaction.response.defer(ephemeral=True)
+                prompt = adapter._build_todo_prompt(action, **kwargs)
+                await adapter._dispatch_todo_text(button_interaction, prompt)
+                await button_interaction.edit_original_response(content="TODO操作を開始しました。")
+
+            @discord.ui.button(label="今日", style=discord.ButtonStyle.primary)
+            async def today(self, button_interaction: discord.Interaction, _button):
+                await self._run(button_interaction, "today")
+
+            @discord.ui.button(label="買い物", style=discord.ButtonStyle.secondary)
+            async def shopping(self, button_interaction: discord.Interaction, _button):
+                await self._run(button_interaction, "shopping")
+
+            @discord.ui.button(label="Later", style=discord.ButtonStyle.secondary)
+            async def later(self, button_interaction: discord.Interaction, _button):
+                await self._run(button_interaction, "later")
+
+            @discord.ui.button(label="新規TODO", style=discord.ButtonStyle.success)
+            async def create(self, button_interaction: discord.Interaction, _button):
+                await button_interaction.response.send_modal(adapter._build_todo_create_modal(button_interaction))
+
+        return TodoControlView()
+
+    def _build_todo_create_modal(self, interaction: discord.Interaction):
+        adapter = self
+
+        class TodoCreateModal(discord.ui.Modal, title="TODO作成"):
+            task = discord.ui.TextInput(label="タスク", placeholder="例: 水曜までにMoshi設定見る", required=True, max_length=400)
+            due = discord.ui.TextInput(label="期限", placeholder="例: 明日 / 来週 / 未設定", required=False, max_length=120)
+
+            async def on_submit(self, modal_interaction: discord.Interaction) -> None:
+                await modal_interaction.response.defer(ephemeral=True)
+                task_value = str(self.task.value).strip()
+                due_value = str(self.due.value).strip()
+                text_value = f"{task_value} 期限:{due_value}" if due_value else task_value
+                prompt = adapter._build_todo_prompt("create", text=text_value)
+                await adapter._dispatch_todo_text(modal_interaction, prompt)
+                await modal_interaction.edit_original_response(content="TODO作成を開始しました。")
+
+        return TodoCreateModal()
+
+    async def _run_todo_slash(
+        self,
+        interaction: discord.Interaction,
+        *,
+        action: str = "today",
+        issue: str = "",
+        text: str = "",
+        target: str = "",
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        prompt = self._build_todo_prompt(action, issue=issue, text=text, target=target)
+        try:
+            if getattr(interaction, "channel", None) is not None:
+                await interaction.channel.send(
+                    "TODO操作カードです。よく使う操作はここから押せます。",
+                    view=self._build_todo_control_view(interaction),
+                )
+        except Exception as e:
+            logger.debug("Discord TODO control card send failed: %s", e)
+        await self._dispatch_todo_text(interaction, prompt)
+        await interaction.edit_original_response(content="TODO操作を開始しました。")
+
     async def _run_simple_slash(
         self,
         interaction: discord.Interaction,
@@ -2314,6 +2432,47 @@ class DiscordAdapter(BasePlatformAdapter):
         @discord.app_commands.describe(prompt="The prompt to run in the background")
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
+
+        @tree.command(name="todo", description="Life TODO dashboard and quick actions")
+        @discord.app_commands.describe(
+            action="TODO action",
+            issue="Issue number for view/done/move (e.g. 250 or #250)",
+            text="Task text for create",
+            target="Move target: tomorrow, next-week, someday, later, doing",
+        )
+        @discord.app_commands.choices(
+            action=[
+                discord.app_commands.Choice(name="today — 今日のTODO", value="today"),
+                discord.app_commands.Choice(name="week — 今週", value="week"),
+                discord.app_commands.Choice(name="shopping — 買い物", value="shopping"),
+                discord.app_commands.Choice(name="later — Later", value="later"),
+                discord.app_commands.Choice(name="view — 詳細", value="view"),
+                discord.app_commands.Choice(name="done — 完了", value="done"),
+                discord.app_commands.Choice(name="move — 移動", value="move"),
+                discord.app_commands.Choice(name="create — 作成", value="create"),
+            ],
+            target=[
+                discord.app_commands.Choice(name="tomorrow — 明日へ", value="tomorrow"),
+                discord.app_commands.Choice(name="next-week — 来週へ", value="next-week"),
+                discord.app_commands.Choice(name="someday — いつかへ", value="someday"),
+                discord.app_commands.Choice(name="later — Laterへ", value="later"),
+                discord.app_commands.Choice(name="doing — Doingへ", value="doing"),
+            ],
+        )
+        async def slash_todo(
+            interaction: discord.Interaction,
+            action: str = "today",
+            issue: str = "",
+            text: str = "",
+            target: str = "",
+        ):
+            await self._run_todo_slash(
+                interaction,
+                action=action,
+                issue=issue,
+                text=text,
+                target=target,
+            )
 
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in

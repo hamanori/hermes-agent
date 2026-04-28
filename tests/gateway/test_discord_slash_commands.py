@@ -148,6 +148,39 @@ async def test_registers_native_restart_slash_command(adapter):
     )
 
 
+@pytest.mark.asyncio
+async def test_registers_native_todo_slash_command(adapter):
+    adapter._run_todo_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "todo" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["todo"](
+        interaction,
+        action="today",
+        issue="",
+        text="",
+        target="",
+    )
+
+    adapter._run_todo_slash.assert_awaited_once_with(
+        interaction,
+        action="today",
+        issue="",
+        text="",
+        target="",
+    )
+
+
+def test_todo_slash_prompt_mapping(adapter):
+    assert adapter._build_todo_prompt("today") == "今日のTODOを見せて。Discord向けに短く、各項目にIssue番号を含めて。"
+    assert adapter._build_todo_prompt("shopping") == "買い物リストを見せて。買った/あとで/詳細の操作がしやすい形で。"
+    assert adapter._build_todo_prompt("done", issue="#250") == "Issue #250 のTODOを完了にして。"
+    assert adapter._build_todo_prompt("move", issue="250", target="next-week") == "Issue #250 のTODOを来週へ送って。"
+    assert adapter._build_todo_prompt("create", text="水曜までにMoshi設定") == "TODO候補として確認カード前提で整理して: 水曜までにMoshi設定"
+
+
 # ------------------------------------------------------------------
 # Auto-registration from COMMAND_REGISTRY
 # ------------------------------------------------------------------
