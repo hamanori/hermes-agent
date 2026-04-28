@@ -3012,6 +3012,41 @@ class DiscordAdapter(BasePlatformAdapter):
         name = f"{prefix}: {snippet}"
         return name[:80]
 
+    def _sanitize_thread_title(self, title: str) -> str:
+        """Normalize an LLM/session title into a Discord thread name."""
+        name = (title or "").strip()
+        name = re.sub(r"[\r\n\t]+", " ", name)
+        name = re.sub(r"\s+", " ", name)
+        name = name.strip(" \"'`*_。.!?！？:：-—")
+        # Avoid low-information generic prefixes in the Discord sidebar.
+        name = re.sub(r"^(相談|ニュース|Discord整理|Hermes設定|タスク整理)[:：\s-]+", "", name).strip()
+        if not name:
+            name = "Hermes相談"
+        if len(name) > 48:
+            name = name[:47].rstrip() + "…"
+        return name
+
+    async def update_thread_title(self, thread_id: str, title: str) -> bool:
+        """Best-effort rename of a Discord thread from a generated conversation title."""
+        if not self._client or not thread_id or not title:
+            return False
+        new_name = self._sanitize_thread_title(title)
+        try:
+            thread = self._client.get_channel(int(thread_id))
+            if not thread:
+                thread = await self._client.fetch_channel(int(thread_id))
+            if not thread or not isinstance(thread, discord.Thread):
+                return False
+            old_name = getattr(thread, "name", "") or ""
+            if old_name == new_name:
+                return False
+            await thread.edit(name=new_name, reason="Hermes auto-updated thread title from conversation context")
+            logger.info("[%s] Renamed Discord thread %s: %r -> %r", self.name, thread_id, old_name, new_name)
+            return True
+        except Exception as e:
+            logger.debug("[%s] Failed to rename Discord thread %s: %s", self.name, thread_id, e, exc_info=True)
+            return False
+
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 

@@ -71,6 +71,12 @@ class FakeThread:
         self.parent_id = getattr(parent, "id", None)
         self.guild = getattr(parent, "guild", None) or SimpleNamespace(name=guild_name)
         self.topic = None
+        self.edit_calls = []
+
+    async def edit(self, **kwargs):
+        self.edit_calls.append(kwargs)
+        if "name" in kwargs:
+            self.name = kwargs["name"]
 
 
 @pytest.fixture
@@ -216,6 +222,22 @@ def test_auto_thread_name_is_compact_and_categorized(adapter):
 def test_auto_thread_name_strips_mentions_urls_and_falls_back(adapter):
     assert adapter._derive_auto_thread_name("<@123> <#456> https://example.com") == "相談: URL"
     assert adapter._derive_auto_thread_name("<@123>   ") == "Hermes相談"
+
+
+@pytest.mark.asyncio
+async def test_update_thread_title_renames_and_sanitizes(adapter):
+    thread = FakeThread(channel_id=777, name="相談: 長い最初の一言")
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda channel_id: thread if channel_id == 777 else None,
+        fetch_channel=AsyncMock(return_value=None),
+    )
+
+    renamed = await adapter.update_thread_title("777", "相談: スレ名自動更新改善。")
+
+    assert renamed is True
+    assert thread.name == "スレ名自動更新改善"
+    assert thread.edit_calls
 
 
 # ── no_thread_channels ───────────────────────────────────────────────

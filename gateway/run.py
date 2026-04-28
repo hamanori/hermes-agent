@@ -5399,6 +5399,15 @@ class GatewayRunner:
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
 
+            await self._maybe_update_discord_thread_title(
+                source=source,
+                session_id=session_entry.session_id,
+                user_message=message_text,
+                assistant_response=response,
+                agent_messages=agent_messages,
+                agent=locals().get("agent", None),
+            )
+
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
@@ -5486,6 +5495,57 @@ class GatewayRunner:
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
+
+    async def _maybe_update_discord_thread_title(
+        self,
+        *,
+        source: SessionSource,
+        session_id: str,
+        user_message: str,
+        assistant_response: str,
+        agent_messages: list,
+        agent: Any = None,
+    ) -> None:
+        """Best-effort update of a Discord thread name from the latest turn.
+
+        Auto-thread creation uses a cheap deterministic placeholder because it
+        runs before the agent has understood the task.  After a turn completes,
+        use the same short-title generator as session titles and apply it to
+        the Discord thread so the sidebar converges to the actual topic.
+        """
+        try:
+            if source.platform != Platform.DISCORD or not getattr(source, "thread_id", None):
+                return
+            adapter = self.adapters.get(source.platform)
+            if not adapter or not hasattr(adapter, "update_thread_title"):
+                return
+            if not user_message or not assistant_response:
+                return
+
+            from agent.title_generator import generate_title
+
+            title = await asyncio.to_thread(
+                generate_title,
+                user_message,
+                assistant_response,
+                20.0,
+                None,
+                None,
+            )
+            if not title:
+                return
+
+            # Keep the internal session title aligned too, but do not let DB
+            # failures block the visible Discord rename.
+            if getattr(self, "_session_db", None) and session_id:
+                try:
+                    self._session_db.set_session_title(session_id, title)
+                except Exception:
+                    pass
+
+            await adapter.update_thread_title(str(source.thread_id), title)
+        except Exception as e:
+            logger.debug("Discord thread title auto-update skipped: %s", e, exc_info=True)
     
     def _format_session_info(self) -> str:
         """Resolve current model config and return a formatted info block.
