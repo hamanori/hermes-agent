@@ -195,6 +195,41 @@ async def test_second_message_during_sentinel_queued_not_duplicate():
         await task1
 
 
+@pytest.mark.asyncio
+async def test_same_session_claimed_while_waiting_for_global_concurrency_slot():
+    """A session waiting behind the gateway-wide agent semaphore must still
+    be claimed so a follow-up cannot queue a duplicate run behind it."""
+    runner = _make_runner()
+    runner._max_concurrent_agents = 1
+    runner._agent_run_semaphore = asyncio.Semaphore(1)
+    await runner._agent_run_semaphore.acquire()
+
+    event1 = _make_event(text="first message")
+    event2 = _make_event(text="second message")
+    session_key = build_session_key(event1.source)
+    inner_started = asyncio.Event()
+
+    async def slow_inner(self_inner, ev, src, qk, generation):
+        inner_started.set()
+        return "ok"
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", slow_inner):
+        task1 = asyncio.create_task(runner._handle_message(event1))
+        await asyncio.sleep(0)
+
+        assert runner._running_agents.get(session_key) is _AGENT_PENDING_SENTINEL
+        assert not inner_started.is_set()
+
+        result2 = await runner._handle_message(event2)
+        assert result2 is None
+        adapter = runner.adapters[Platform.TELEGRAM]
+        assert adapter._pending_messages[session_key] is event2
+
+        runner._agent_run_semaphore.release()
+        await task1
+        assert inner_started.is_set()
+
+
 def test_merge_pending_message_event_merges_text_and_photo_followups():
     pending = {}
     source = SessionSource(
@@ -505,7 +540,8 @@ async def test_global_agent_concurrency_limit_allows_two_and_queues_third():
 
         assert len(started) == 2
         third_key = build_session_key(events[2].source)
-        assert third_key not in runner._running_agents
+        assert runner._running_agents.get(third_key) is _AGENT_PENDING_SENTINEL
+        assert third_key not in started
 
         release.set()
         results = await asyncio.gather(*tasks)
