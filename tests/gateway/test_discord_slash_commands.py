@@ -641,6 +641,7 @@ class _FakeTextChannel:
         self.name = name
         self.guild = SimpleNamespace(name=guild_name, id=1)
         self.topic = None
+        self.send = AsyncMock()
 
 
 class _FakeThreadChannel(_discord_mod.Thread):
@@ -666,6 +667,58 @@ def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza
         created_at=None,
         id=12345,
     )
+
+
+def test_thread_lifecycle_view_only_builds_for_threads(adapter):
+    text_channel = _FakeTextChannel()
+    thread_channel = _FakeThreadChannel()
+
+    assert adapter._build_thread_lifecycle_view(text_channel) is None
+    view = adapter._build_thread_lifecycle_view(thread_channel)
+
+    assert view is not None
+    assert getattr(view, "timeout", None) is None
+    assert getattr(view, "adapter", None) is adapter
+
+
+@pytest.mark.asyncio
+async def test_todo_card_text_trigger_sends_card_without_slash_sync(adapter, monkeypatch):
+    """Text trigger should provide the TODO button card even when Discord slash sync is delayed."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+    channel = _FakeTextChannel()
+    msg = _fake_message(channel, content="todoカード")
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_message(msg)
+
+    channel.send.assert_awaited_once()
+    args, kwargs = channel.send.await_args
+    assert "TODO操作カード" in args[0]
+    assert kwargs.get("view") is not None
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_todo_text_trigger_dispatches_today_prompt(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+    channel = _FakeTextChannel()
+    msg = _fake_message(channel, content="todo")
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = capture_handle
+
+    await adapter._handle_message(msg)
+
+    channel.send.assert_awaited_once()
+    assert len(captured_events) == 1
+    assert captured_events[0].text == adapter._build_todo_prompt("today")
 
 
 @pytest.mark.asyncio

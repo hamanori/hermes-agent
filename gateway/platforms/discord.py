@@ -529,6 +529,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+        self._thread_lifecycle_persistent_view_registered: bool = False
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -629,6 +630,24 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
                 adapter_self._ready_event.set()
+
+                # Register persistent lifecycle buttons so already-sent thread
+                # cleanup controls continue to work after a gateway restart.
+                if (
+                    not adapter_self._thread_lifecycle_persistent_view_registered
+                    and adapter_self._thread_lifecycle_buttons_enabled()
+                ):
+                    try:
+                        adapter_self._client.add_view(
+                            ThreadLifecycleView(
+                                adapter=adapter_self,
+                                allowed_user_ids=adapter_self._allowed_user_ids,
+                                keep_archive_minutes=10080,
+                            )
+                        )
+                        adapter_self._thread_lifecycle_persistent_view_registered = True
+                    except Exception as e:
+                        logger.debug("Could not register Discord thread lifecycle persistent view: %s", e)
 
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
                     adapter_self._post_connect_task.cancel()
@@ -1119,10 +1138,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                view = self._build_thread_lifecycle_view(channel) if i == len(chunks) - 1 else None
                 try:
                     msg = await channel.send(
                         content=chunk,
                         reference=chunk_reference,
+                        view=view,
                     )
                 except Exception as e:
                     err_text = str(e)
@@ -1145,6 +1166,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         msg = await channel.send(
                             content=chunk,
                             reference=None,
+                            view=view,
                         )
                     else:
                         raise
@@ -1159,6 +1181,25 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    def _thread_lifecycle_buttons_enabled(self) -> bool:
+        """Return whether normal Discord thread replies should include cleanup buttons."""
+        raw = self.config.extra.get("thread_lifecycle_buttons", True)
+        if isinstance(raw, str):
+            return raw.lower() not in ("false", "0", "no", "off")
+        return bool(raw)
+
+    def _build_thread_lifecycle_view(self, channel: Any):
+        """Build the 4-button thread cleanup view for Discord thread replies."""
+        if not DISCORD_AVAILABLE or not self._thread_lifecycle_buttons_enabled():
+            return None
+        if not isinstance(channel, discord.Thread):
+            return None
+        return ThreadLifecycleView(
+            adapter=self,
+            allowed_user_ids=self._allowed_user_ids,
+            keep_archive_minutes=10080,
+        )
 
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
@@ -2173,6 +2214,26 @@ class DiscordAdapter(BasePlatformAdapter):
             }.get(target, target or "指定先へ")
             return f"Issue {issue_ref} のTODOを{target_label}送って。"
         return "今日のTODOを見せて。Discord向けに短く、各項目にIssue番号を含めて。"
+
+    async def _send_todo_control_card(self, channel: Any) -> None:
+        view = None
+        try:
+            view = self._build_todo_control_view(None)
+        except Exception as e:
+            logger.debug("Discord TODO control view build failed: %s", e)
+        await channel.send(
+            "TODO操作カードです。よく使う操作はここから押せます。",
+            view=view,
+        )
+
+    def _todo_text_trigger_action(self, text: str) -> str | None:
+        normalized = (text or "").strip().lower().replace("　", " ")
+        normalized = " ".join(normalized.split())
+        if normalized in {"todo", "todo today", "todo一覧", "todo 一覧", "今日のtodo", "今日の todo"}:
+            return "today"
+        if normalized in {"todoカード", "todo card", "todo操作", "todo 操作", "todoボタン", "todo ボタン"}:
+            return "card"
+        return None
 
     async def _dispatch_todo_text(self, interaction: discord.Interaction, prompt: str) -> None:
         event = self._build_slash_event(interaction, prompt)
@@ -3668,6 +3729,18 @@ class DiscordAdapter(BasePlatformAdapter):
         if thread_id:
             self._threads.mark(thread_id)
 
+        todo_trigger_action = self._todo_text_trigger_action(event_text)
+        if todo_trigger_action:
+            try:
+                await self._send_todo_control_card(effective_channel)
+            except Exception as e:
+                logger.debug("Discord TODO text-trigger card send failed: %s", e)
+            if todo_trigger_action == "card":
+                return
+            event.text = self._build_todo_prompt(todo_trigger_action)
+            event.message_type = MessageType.COMMAND
+            msg_type = MessageType.COMMAND
+
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the Discord client.
         if msg_type == MessageType.TEXT and self._text_batch_delay_seconds > 0:
@@ -3762,6 +3835,127 @@ class DiscordAdapter(BasePlatformAdapter):
 # ---------------------------------------------------------------------------
 
 if DISCORD_AVAILABLE:
+
+    class ThreadLifecycleView(discord.ui.View):
+        """Four quick cleanup actions for normal Hermes Discord thread replies."""
+
+        def __init__(self, adapter, allowed_user_ids: set, keep_archive_minutes: int = 10080):
+            super().__init__(timeout=None)
+            self.adapter = adapter
+            self.allowed_user_ids = allowed_user_ids
+            self.keep_archive_minutes = keep_archive_minutes
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            if not self.allowed_user_ids:
+                return True
+            return str(interaction.user.id) in self.allowed_user_ids
+
+        async def _deny_if_unauthorized(self, interaction: discord.Interaction) -> bool:
+            if self._check_auth(interaction):
+                return False
+            await interaction.response.send_message("このボタンを使う権限がないみたいです〜", ephemeral=True)
+            return True
+
+        async def _thread(self, interaction: discord.Interaction):
+            channel = getattr(interaction, "channel", None)
+            if isinstance(channel, discord.Thread):
+                return channel
+            await interaction.response.send_message("これはスレッド内でだけ使えます〜", ephemeral=True)
+            return None
+
+        def _disable_close_button(self):
+            for child in self.children:
+                if getattr(child, "custom_id", "") == "thread_lifecycle_close":
+                    child.disabled = True
+
+        @discord.ui.button(label="完了して閉じる", style=discord.ButtonStyle.green, emoji="✅", custom_id="thread_lifecycle_close")
+        async def close_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            self._disable_close_button()
+            await interaction.response.edit_message(view=self)
+            try:
+                await thread.edit(archived=True, reason=f"Closed by {interaction.user.display_name} via Hermes button")
+            except Exception as exc:
+                await interaction.followup.send(f"閉じるのに失敗しました: {exc}", ephemeral=True)
+
+        @discord.ui.button(label="継続する", style=discord.ButtonStyle.blurple, emoji="📌", custom_id="thread_lifecycle_keep")
+        async def keep_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            try:
+                name = getattr(thread, "name", "") or ""
+                new_name = name if name.startswith("継続:") else f"継続: {name}"[:100]
+                await thread.edit(
+                    name=new_name,
+                    archived=False,
+                    auto_archive_duration=self.keep_archive_minutes,
+                    reason=f"Kept by {interaction.user.display_name} via Hermes button",
+                )
+                await interaction.response.send_message("📌 継続扱いにして、自動アーカイブを延長しました〜", ephemeral=True)
+            except Exception as exc:
+                await interaction.response.send_message(f"継続設定に失敗しました: {exc}", ephemeral=True)
+
+        async def _dispatch_agent_request(self, interaction: discord.Interaction, text: str) -> None:
+            thread = getattr(interaction, "channel", None)
+            if not isinstance(thread, discord.Thread):
+                return
+            parent = getattr(thread, "parent", None)
+            guild = getattr(thread, "guild", None) or getattr(parent, "guild", None)
+            guild_name = getattr(guild, "name", "") or ""
+            chat_name = self.adapter._format_thread_chat_name(thread)
+            chat_topic = self.adapter._get_effective_topic(thread, is_thread=True)
+            source = self.adapter.build_source(
+                chat_id=str(thread.id),
+                chat_name=chat_name or (f"{guild_name} / {thread.name}" if guild_name else thread.name),
+                chat_type="thread",
+                user_id=str(interaction.user.id),
+                user_name=interaction.user.display_name,
+                thread_id=str(thread.id),
+                chat_topic=chat_topic,
+            )
+            parent_id = str(getattr(parent, "id", "") or "")
+            event = MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=interaction,
+                auto_skill=self.adapter._resolve_channel_skills(str(thread.id), parent_id or None),
+                channel_prompt=self.adapter._resolve_channel_prompt(str(thread.id), parent_id or None),
+            )
+            asyncio.create_task(self.adapter.handle_message(event))
+
+        @discord.ui.button(label="Issue化する", style=discord.ButtonStyle.grey, emoji="📝", custom_id="thread_lifecycle_issue")
+        async def create_issue_hint(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            await interaction.response.send_message("📝 Issue化を始めますね〜", ephemeral=True)
+            await self._dispatch_agent_request(
+                interaction,
+                "このスレッドの内容を要約して GitHub Issue にしてください。作成後、このスレッドは閉じる候補にしてください。",
+            )
+
+        @discord.ui.button(label="あとで整理", style=discord.ButtonStyle.grey, emoji="🗂", custom_id="thread_lifecycle_later")
+        async def organize_later_hint(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            await interaction.response.send_message("🗂 あとで整理を始めますね〜", ephemeral=True)
+            await self._dispatch_agent_request(
+                interaction,
+                "このスレッドの内容を Project Life / TODO / メモのどれに送るべきか整理して、必要なら登録してください。",
+            )
 
     class ExecApprovalView(discord.ui.View):
         """
