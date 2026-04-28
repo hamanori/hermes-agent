@@ -789,8 +789,6 @@ class GatewayRunner:
         self._show_reasoning = self._load_show_reasoning()
         self._busy_input_mode = self._load_busy_input_mode()
         self._restart_drain_timeout = self._load_restart_drain_timeout()
-        self._max_concurrent_agents = self._load_max_concurrent_agents()
-        self._agent_run_semaphore = asyncio.Semaphore(self._max_concurrent_agents)
         self._provider_routing = self._load_provider_routing()
         self._fallback_model = self._load_fallback_model()
 
@@ -1702,43 +1700,6 @@ class GatewayRunner:
                     raw,
                     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
                 )
-        return value
-
-    @staticmethod
-    def _load_max_concurrent_agents() -> int:
-        """Load gateway-wide concurrent agent run cap.
-
-        This protects Discord/API/browser resources while still allowing the
-        two parallel task threads hiro wants.  Values below 1 are invalid;
-        default is 2.
-        """
-        raw = os.getenv("HERMES_GATEWAY_MAX_CONCURRENT_AGENTS", "").strip()
-        if not raw:
-            try:
-                import yaml as _y
-                cfg_path = _hermes_home / "config.yaml"
-                if cfg_path.exists():
-                    with open(cfg_path, encoding="utf-8") as _f:
-                        cfg = _y.safe_load(_f) or {}
-                    agent_cfg = cfg.get("agent", {}) or {}
-                    gateway_cfg = cfg.get("gateway", {}) or {}
-                    raw = str(
-                        agent_cfg.get("max_concurrent_gateway_agents", "")
-                        or gateway_cfg.get("max_concurrent_agents", "")
-                        or ""
-                    ).strip()
-            except Exception:
-                pass
-        if not raw:
-            return 2
-        try:
-            value = int(raw)
-        except (TypeError, ValueError):
-            logger.warning("Invalid gateway max concurrent agents '%s', using default 2", raw)
-            return 2
-        if value < 1:
-            logger.warning("Invalid gateway max concurrent agents '%s', using default 2", raw)
-            return 2
         return value
 
     @staticmethod
@@ -4400,27 +4361,16 @@ class GatewayRunner:
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _handle_message_with_agent registering the real
-        # AIAgent, there may be awaits for the global concurrency gate,
-        # hooks, vision enrichment, STT, and session hygiene compression.
-        # The sentinel must be visible during *all* of that time; otherwise
-        # a second message for the same session can queue behind the global
-        # semaphore and later start a duplicate agent turn.
+        # AIAgent, there may be awaits for hooks, vision enrichment, STT,
+        # and session hygiene compression. The sentinel must be visible
+        # during *all* of that time; otherwise a second message for the same
+        # session can start a duplicate agent turn.
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
-            _agent_run_semaphore = getattr(self, "_agent_run_semaphore", None)
-            if _agent_run_semaphore is None:
-                return await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
-            if getattr(_agent_run_semaphore, "locked", lambda: False)():
-                logger.info(
-                    "Gateway agent concurrency limit reached (%s); waiting to run session %s",
-                    getattr(self, "_max_concurrent_agents", "unknown"),
-                    _quick_key,
-                )
-            async with _agent_run_semaphore:
-                return await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            return await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
         finally:
             # If _run_agent replaced the sentinel with a real agent and then
             # cleaned it up, this is a no-op. If we exited early (exception,
