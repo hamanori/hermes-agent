@@ -46,6 +46,8 @@ def _make_runner():
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._session_run_generation = {}
+    runner._max_concurrent_agents = 2
+    runner._agent_run_semaphore = asyncio.Semaphore(2)
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._voice_mode = {}
@@ -474,3 +476,38 @@ async def test_shutdown_skips_sentinel():
     # Real agent should have been interrupted
     real_agent.interrupt.assert_called_once()
     # Should not have raised on the sentinel
+
+
+@pytest.mark.asyncio
+async def test_global_agent_concurrency_limit_allows_two_and_queues_third():
+    """Different sessions may run in parallel, but only up to the gateway cap."""
+    runner = _make_runner()
+    runner._max_concurrent_agents = 2
+    runner._agent_run_semaphore = asyncio.Semaphore(2)
+
+    started = []
+    release = asyncio.Event()
+
+    async def slow_inner(self_inner, ev, src, qk, generation):
+        started.append(qk)
+        await release.wait()
+        return qk
+
+    events = [
+        _make_event(text="hello", chat_id="1"),
+        _make_event(text="hello", chat_id="2"),
+        _make_event(text="hello", chat_id="3"),
+    ]
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", slow_inner):
+        tasks = [asyncio.create_task(runner._handle_message(event)) for event in events]
+        await asyncio.sleep(0.05)
+
+        assert len(started) == 2
+        third_key = build_session_key(events[2].source)
+        assert third_key not in runner._running_agents
+
+        release.set()
+        results = await asyncio.gather(*tasks)
+
+    assert sorted(results) == sorted(build_session_key(event.source) for event in events)

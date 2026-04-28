@@ -245,3 +245,41 @@ async def test_gateway_stop_kills_tool_subprocesses_on_graceful_path(monkeypatch
 
     # Only the final catch-all fires on the graceful path.
     assert kill_count == 1
+
+
+@pytest.mark.asyncio
+async def test_request_restart_defers_until_running_agents_finish():
+    runner, _adapter = make_restart_runner()
+    runner._running_agents = {"session": MagicMock()}
+
+    started = runner.request_restart(detached=True, via_service=False)
+
+    assert started is True
+    assert runner._restart_requested is True
+    assert runner._restart_deferred_until_idle is True
+    assert runner._restart_task_started is False
+    assert runner._background_tasks == set()
+
+    runner._release_running_agent_state("session")
+
+    assert runner._restart_deferred_until_idle is False
+    assert runner._restart_task_started is True
+    assert len(runner._background_tasks) == 1
+
+    # Do not let the scheduled restart task run the full shutdown path in this unit test.
+    for task in list(runner._background_tasks):
+        task.cancel()
+    await asyncio.gather(*runner._background_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_restart_command_reports_scheduled_not_draining_when_agents_active():
+    runner, _adapter = make_restart_runner()
+    runner._running_agents = {"session": MagicMock()}
+    event = MessageEvent(text="/restart", source=make_restart_source(), message_id="1")
+
+    response = await runner._handle_restart_command(event)
+
+    assert "Restart scheduled after 1 active agent" in response
+    assert runner._restart_deferred_until_idle is True
+    assert runner._restart_task_started is False

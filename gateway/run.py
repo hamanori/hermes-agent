@@ -768,6 +768,7 @@ class GatewayRunner:
     _draining: bool = False
     _restart_requested: bool = False
     _restart_task_started: bool = False
+    _restart_deferred_until_idle: bool = False
     _restart_detached: bool = False
     _restart_via_service: bool = False
     _stop_task: Optional[asyncio.Task] = None
@@ -807,6 +808,7 @@ class GatewayRunner:
         self._draining = False
         self._restart_requested = False
         self._restart_task_started = False
+        self._restart_deferred_until_idle = False
         self._restart_detached = False
         self._restart_via_service = False
         self._stop_task: Optional[asyncio.Task] = None
@@ -828,6 +830,7 @@ class GatewayRunner:
         self._queued_events: Dict[str, List[MessageEvent]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
+
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -2249,7 +2252,24 @@ class GatewayRunner:
         self._restart_requested = True
         self._restart_detached = detached
         self._restart_via_service = via_service
+
+        if self._running_agent_count() > 0:
+            self._restart_deferred_until_idle = True
+            logger.info(
+                "Gateway restart deferred until %d active agent(s) finish.",
+                self._running_agent_count(),
+            )
+            self._update_runtime_status("running")
+            return True
+
+        self._start_restart_task(detached=detached, via_service=via_service)
+        return True
+
+    def _start_restart_task(self, *, detached: bool, via_service: bool) -> bool:
+        if self._restart_task_started:
+            return False
         self._restart_task_started = True
+        self._restart_deferred_until_idle = False
 
         async def _run_restart() -> None:
             await asyncio.sleep(0.05)
@@ -2259,6 +2279,19 @@ class GatewayRunner:
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return True
+
+    def _maybe_start_deferred_restart(self) -> None:
+        if not self._restart_deferred_until_idle:
+            return
+        if self._restart_task_started or self._draining:
+            return
+        if self._running_agent_count() > 0:
+            return
+        logger.info("Starting deferred gateway restart after active agents finished.")
+        self._start_restart_task(
+            detached=self._restart_detached,
+            via_service=self._restart_via_service,
+        )
 
     async def start(self) -> bool:
         """
@@ -3106,24 +3139,20 @@ class GatewayRunner:
             release_gateway_runtime_lock()
 
             # Write a clean-shutdown marker so the next startup knows this
-            # wasn't a crash.  suspend_recently_active() only needs to run
-            # after unexpected exits.  However, if the drain timed out and
-            # agents were force-interrupted, their sessions may be in an
-            # incomplete state (trailing tool response, no final assistant
-            # message).  Skip the marker in that case so the next startup
-            # suspends those sessions — giving users a clean slate instead
-            # of resuming a half-finished tool loop.
-            if not timed_out:
-                try:
-                    (_hermes_home / ".clean_shutdown").touch()
-                except Exception:
-                    pass
-            else:
-                logger.info(
-                    "Skipping .clean_shutdown marker — drain timed out with "
-                    "interrupted agents; next startup will suspend recently "
-                    "active sessions."
-                )
+            # was a controlled stop/restart rather than a crash.
+            #
+            # Even when the drain times out, this process has already marked
+            # the still-running sessions as resume_pending and recorded their
+            # restart-failure counters above.  Startup should therefore skip
+            # the broad suspend_recently_active() crash-recovery sweep;
+            # otherwise unrelated sessions that happened to update shortly
+            # before the restart get auto-reset as collateral damage.  Truly
+            # stuck sessions still converge to suspended via the persisted
+            # .restart_failure_counts threshold.
+            try:
+                (_hermes_home / ".clean_shutdown").touch()
+            except Exception:
+                pass
 
             # Track sessions that were active at shutdown for stuck-loop
             # detection (#7536).  On each restart, the counter increments
@@ -4330,32 +4359,45 @@ class GatewayRunner:
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
 
-        # ── Claim this session before any await ───────────────────────
-        # Between here and _run_agent registering the real AIAgent, there
-        # are numerous await points (hooks, vision enrichment, STT,
-        # session hygiene compression).  Without this sentinel a second
-        # message arriving during any of those yields would pass the
-        # "already running" guard and spin up a duplicate agent for the
-        # same session — corrupting the transcript.
-        self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
-        self._running_agents_ts[_quick_key] = time.time()
-        _run_generation = self._begin_session_run_generation(_quick_key)
+        async def _run_with_session_claim() -> Optional[str]:
+            # ── Claim this session before any await ───────────────────────
+            # Between here and _run_agent registering the real AIAgent, there
+            # are numerous await points (hooks, vision enrichment, STT,
+            # session hygiene compression).  Without this sentinel a second
+            # message arriving during any of those yields would pass the
+            # "already running" guard and spin up a duplicate agent for the
+            # same session — corrupting the transcript.
+            self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
+            self._running_agents_ts[_quick_key] = time.time()
+            _run_generation = self._begin_session_run_generation(_quick_key)
 
-        try:
-            return await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
-        finally:
-            # If _run_agent replaced the sentinel with a real agent and
-            # then cleaned it up, this is a no-op.  If we exited early
-            # (exception, command fallthrough, etc.) the sentinel must
-            # not linger or the session would be permanently locked out.
-            if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
-                self._release_running_agent_state(_quick_key)
-            else:
-                # Agent path already cleaned _running_agents; make sure
-                # the paired metadata dicts are gone too.
-                self._running_agents_ts.pop(_quick_key, None)
-                if hasattr(self, "_busy_ack_ts"):
-                    self._busy_ack_ts.pop(_quick_key, None)
+            try:
+                return await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            finally:
+                # If _run_agent replaced the sentinel with a real agent and
+                # then cleaned it up, this is a no-op.  If we exited early
+                # (exception, command fallthrough, etc.) the sentinel must
+                # not linger or the session would be permanently locked out.
+                if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
+                    self._release_running_agent_state(_quick_key)
+                else:
+                    # Agent path already cleaned _running_agents; make sure
+                    # the paired metadata dicts are gone too.
+                    self._running_agents_ts.pop(_quick_key, None)
+                    if hasattr(self, "_busy_ack_ts"):
+                        self._busy_ack_ts.pop(_quick_key, None)
+
+        _agent_run_semaphore = getattr(self, "_agent_run_semaphore", None)
+        if _agent_run_semaphore is None:
+            return await _run_with_session_claim()
+        if getattr(_agent_run_semaphore, "locked", lambda: False)():
+            logger.info(
+                "Gateway agent concurrency limit reached (%s); waiting to run session %s",
+                getattr(self, "_max_concurrent_agents", "unknown"),
+                _quick_key,
+            )
+        async with _agent_run_semaphore:
+            return await _run_with_session_claim()
 
     async def _prepare_inbound_message_text(
         self,
@@ -5871,6 +5913,8 @@ class GatewayRunner:
 
         if self._restart_requested or self._draining:
             count = self._running_agent_count()
+            if count and self._restart_deferred_until_idle:
+                return f"⏳ Restart scheduled after {count} active agent(s) finish."
             if count:
                 return f"⏳ Draining {count} active agent(s) before restart..."
             return "⏳ Gateway restart already in progress..."
@@ -5920,7 +5964,7 @@ class GatewayRunner:
         else:
             self.request_restart(detached=True, via_service=False)
         if active_agents:
-            return f"⏳ Draining {active_agents} active agent(s) before restart..."
+            return f"⏳ Restart scheduled after {active_agents} active agent(s) finish."
         return "♻ Restarting gateway. If you aren't notified within 60 seconds, restart from the console with `hermes gateway restart`."
 
     def _is_stale_restart_redelivery(self, event: MessageEvent) -> bool:
@@ -9184,6 +9228,7 @@ class GatewayRunner:
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
             self._busy_ack_ts.pop(session_key, None)
+        self._maybe_start_deferred_restart()
         return True
 
     def _clear_session_boundary_security_state(self, session_key: str) -> None:
