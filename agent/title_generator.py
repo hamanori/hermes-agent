@@ -19,9 +19,11 @@ logger = logging.getLogger(__name__)
 FailureCallback = Callable[[str, BaseException], None]
 
 _TITLE_PROMPT = (
-    "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
-    "following exchange. The title should capture the main topic or intent. "
-    "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
+    "Generate a compact, descriptive conversation title. Capture the concrete task/outcome, "
+    "not a generic category. Prefer Japanese when the conversation is Japanese. "
+    "Keep it very short: 8-18 Japanese characters or 3-6 English words. "
+    "Do NOT add generic prefixes like 相談, ニュース, Discord整理, Task, or Title. "
+    "Return ONLY the title text, nothing else. No quotes, no trailing punctuation."
 )
 
 

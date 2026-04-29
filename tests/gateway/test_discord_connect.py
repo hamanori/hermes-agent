@@ -474,6 +474,25 @@ async def test_post_connect_initialization_skips_sync_when_policy_off(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_post_connect_initialization_skips_sync_when_config_policy_off(monkeypatch):
+    monkeypatch.delenv("DISCORD_COMMAND_SYNC_POLICY", raising=False)
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"command_sync_policy": "off"},
+        )
+    )
+
+    fake_tree = SimpleNamespace(sync=AsyncMock())
+    adapter._client = SimpleNamespace(tree=fake_tree)
+
+    await adapter._run_post_connect_initialization()
+
+    fake_tree.sync.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_safe_sync_reads_permission_attrs_from_existing_command():
     """Regression: AppCommand.to_dict() in discord.py does NOT include
     nsfw, dm_permission, or default_member_permissions — they live only

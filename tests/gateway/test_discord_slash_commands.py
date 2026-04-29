@@ -97,7 +97,10 @@ class FakeTree:
 
 
 @pytest.fixture
-def adapter():
+def adapter(monkeypatch):
+    # Unit tests should not inherit the developer's live Discord gateway
+    # whitelist; fake channel IDs in these tests are intentionally tiny.
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
     config = PlatformConfig(enabled=True, token="***")
     adapter = DiscordAdapter(config)
     adapter._client = SimpleNamespace(
@@ -146,6 +149,39 @@ async def test_registers_native_restart_slash_command(adapter):
         "/restart",
         "Restart requested~",
     )
+
+
+@pytest.mark.asyncio
+async def test_registers_native_todo_slash_command(adapter):
+    adapter._run_todo_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "todo" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["todo"](
+        interaction,
+        action="today",
+        issue="",
+        text="",
+        target="",
+    )
+
+    adapter._run_todo_slash.assert_awaited_once_with(
+        interaction,
+        action="today",
+        issue="",
+        text="",
+        target="",
+    )
+
+
+def test_todo_slash_prompt_mapping(adapter):
+    assert adapter._build_todo_prompt("today") == "今日のTODOを見せて。Discord向けに短く、各項目にIssue番号を含めて。"
+    assert adapter._build_todo_prompt("shopping") == "買い物リストを見せて。買った/あとで/詳細の操作がしやすい形で。"
+    assert adapter._build_todo_prompt("done", issue="#250") == "Issue #250 のTODOを完了にして。"
+    assert adapter._build_todo_prompt("move", issue="250", target="next-week") == "Issue #250 のTODOを来週へ送って。"
+    assert adapter._build_todo_prompt("create", text="水曜までにMoshi設定") == "TODO候補として確認カード前提で整理して: 水曜までにMoshi設定"
 
 
 # ------------------------------------------------------------------
@@ -493,7 +529,7 @@ async def test_auto_create_thread_uses_message_content_as_name(adapter):
     assert result is thread
     message.create_thread.assert_awaited_once()
     call_kwargs = message.create_thread.await_args[1]
-    assert call_kwargs["name"] == "Hello world, how are you?"
+    assert call_kwargs["name"] == "相談: Hello world"
     assert call_kwargs["auto_archive_duration"] == 1440
 
 
@@ -518,7 +554,7 @@ async def test_auto_create_thread_strips_mention_syntax_from_name(adapter):
     name = message.create_thread.await_args[1]["name"]
     assert "<@" not in name, f"role/user mention leaked: {name!r}"
     assert "<#" not in name, f"channel mention leaked: {name!r}"
-    assert name == "please help"
+    assert name == "相談: please help"
 
 
 @pytest.mark.asyncio
@@ -536,7 +572,7 @@ async def test_auto_create_thread_falls_back_to_hermes_when_only_mentions(adapte
     await adapter._auto_create_thread(message)
 
     name = message.create_thread.await_args[1]["name"]
-    assert name == "Hermes"
+    assert name == "Hermes相談"
 
 
 @pytest.mark.asyncio
@@ -555,7 +591,8 @@ async def test_auto_create_thread_truncates_long_names(adapter):
     assert result is thread
     call_kwargs = message.create_thread.await_args[1]
     assert len(call_kwargs["name"]) <= 80
-    assert call_kwargs["name"].endswith("...")
+    assert call_kwargs["name"].startswith("相談: ")
+    assert call_kwargs["name"].endswith("…")
 
 
 @pytest.mark.asyncio
@@ -571,9 +608,9 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
 
     result = await adapter._auto_create_thread(message)
     assert result is thread
-    message.channel.send.assert_awaited_once_with("🧵 Thread created by Hermes: **Hello**")
+    message.channel.send.assert_awaited_once_with("🧵 Thread created by Hermes: **相談: Hello**")
     seed_message.create_thread.assert_awaited_once_with(
-        name="Hello",
+        name="相談: Hello",
         auto_archive_duration=1440,
         reason="Auto-threaded from mention by Jezza",
     )
@@ -608,6 +645,7 @@ class _FakeTextChannel:
         self.name = name
         self.guild = SimpleNamespace(name=guild_name, id=1)
         self.topic = None
+        self.send = AsyncMock()
 
 
 class _FakeThreadChannel(_discord_mod.Thread):
@@ -633,6 +671,67 @@ def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza
         created_at=None,
         id=12345,
     )
+
+
+def test_thread_lifecycle_view_only_builds_for_threads(adapter):
+    text_channel = _FakeTextChannel()
+    thread_channel = _FakeThreadChannel()
+
+    assert adapter._build_thread_lifecycle_view(text_channel) is None
+    view = adapter._build_thread_lifecycle_view(thread_channel)
+
+    assert view is not None
+    assert getattr(view, "timeout", None) is None
+    assert getattr(view, "adapter", None) is adapter
+
+
+def test_thread_lifecycle_view_can_be_suppressed_by_metadata(adapter):
+    thread_channel = _FakeThreadChannel()
+
+    assert adapter._build_thread_lifecycle_view(
+        thread_channel,
+        {"thread_lifecycle_buttons": False},
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_todo_card_text_trigger_sends_card_without_slash_sync(adapter, monkeypatch):
+    """Text trigger should provide the TODO button card even when Discord slash sync is delayed."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+    channel = _FakeTextChannel()
+    msg = _fake_message(channel, content="todoカード")
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_message(msg)
+
+    channel.send.assert_awaited_once()
+    args, kwargs = channel.send.await_args
+    assert "TODO操作カード" in args[0]
+    assert kwargs.get("view") is not None
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_todo_text_trigger_dispatches_today_prompt(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+    channel = _FakeTextChannel()
+    msg = _fake_message(channel, content="todo")
+    captured_events = []
+
+    async def capture_handle(event):
+        captured_events.append(event)
+
+    adapter.handle_message = capture_handle
+
+    await adapter._handle_message(msg)
+
+    channel.send.assert_awaited_once()
+    assert len(captured_events) == 1
+    assert captured_events[0].text == adapter._build_todo_prompt("today")
 
 
 @pytest.mark.asyncio
