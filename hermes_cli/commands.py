@@ -151,6 +151,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("connect", "disconnect", "status")),
     CommandDef("plugins", "List installed plugins and their status",
                "Tools & Skills", cli_only=True),
+    CommandDef("todo", "Manage TODOs through the agent (create, list, update, complete)",
+               "Tools & Skills", gateway_only=True, args_hint="[list|add|done|update] [details]",
+               subcommands=("list", "add", "done", "update", "complete")),
 
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",

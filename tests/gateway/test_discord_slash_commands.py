@@ -97,7 +97,10 @@ class FakeTree:
 
 
 @pytest.fixture
-def adapter():
+def adapter(monkeypatch):
+    # Unit tests should not inherit the developer's live Discord gateway
+    # whitelist; fake channel IDs in these tests are intentionally tiny.
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
     config = PlatformConfig(enabled=True, token="***")
     adapter = DiscordAdapter(config)
     adapter._client = SimpleNamespace(
@@ -526,7 +529,7 @@ async def test_auto_create_thread_uses_message_content_as_name(adapter):
     assert result is thread
     message.create_thread.assert_awaited_once()
     call_kwargs = message.create_thread.await_args[1]
-    assert call_kwargs["name"] == "Hello world, how are you?"
+    assert call_kwargs["name"] == "相談: Hello world"
     assert call_kwargs["auto_archive_duration"] == 1440
 
 
@@ -551,7 +554,7 @@ async def test_auto_create_thread_strips_mention_syntax_from_name(adapter):
     name = message.create_thread.await_args[1]["name"]
     assert "<@" not in name, f"role/user mention leaked: {name!r}"
     assert "<#" not in name, f"channel mention leaked: {name!r}"
-    assert name == "please help"
+    assert name == "相談: please help"
 
 
 @pytest.mark.asyncio
@@ -569,7 +572,7 @@ async def test_auto_create_thread_falls_back_to_hermes_when_only_mentions(adapte
     await adapter._auto_create_thread(message)
 
     name = message.create_thread.await_args[1]["name"]
-    assert name == "Hermes"
+    assert name == "Hermes相談"
 
 
 @pytest.mark.asyncio
@@ -588,7 +591,8 @@ async def test_auto_create_thread_truncates_long_names(adapter):
     assert result is thread
     call_kwargs = message.create_thread.await_args[1]
     assert len(call_kwargs["name"]) <= 80
-    assert call_kwargs["name"].endswith("...")
+    assert call_kwargs["name"].startswith("相談: ")
+    assert call_kwargs["name"].endswith("…")
 
 
 @pytest.mark.asyncio
@@ -604,9 +608,9 @@ async def test_auto_create_thread_falls_back_to_seed_message(adapter):
 
     result = await adapter._auto_create_thread(message)
     assert result is thread
-    message.channel.send.assert_awaited_once_with("🧵 Thread created by Hermes: **Hello**")
+    message.channel.send.assert_awaited_once_with("🧵 Thread created by Hermes: **相談: Hello**")
     seed_message.create_thread.assert_awaited_once_with(
-        name="Hello",
+        name="相談: Hello",
         auto_archive_duration=1440,
         reason="Auto-threaded from mention by Jezza",
     )
@@ -679,6 +683,15 @@ def test_thread_lifecycle_view_only_builds_for_threads(adapter):
     assert view is not None
     assert getattr(view, "timeout", None) is None
     assert getattr(view, "adapter", None) is adapter
+
+
+def test_thread_lifecycle_view_can_be_suppressed_by_metadata(adapter):
+    thread_channel = _FakeThreadChannel()
+
+    assert adapter._build_thread_lifecycle_view(
+        thread_channel,
+        {"thread_lifecycle_buttons": False},
+    ) is None
 
 
 @pytest.mark.asyncio

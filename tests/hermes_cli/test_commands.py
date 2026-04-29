@@ -181,6 +181,9 @@ class TestGatewayKnownCommands:
         assert "bg" in GATEWAY_KNOWN_COMMANDS
         assert "background" in GATEWAY_KNOWN_COMMANDS
 
+    def test_todo_in_gateway(self):
+        assert "todo" in GATEWAY_KNOWN_COMMANDS
+
     def test_is_frozenset(self):
         assert isinstance(GATEWAY_KNOWN_COMMANDS, frozenset)
 
@@ -206,6 +209,13 @@ class TestGatewayHelpLines:
         bg_line = [l for l in lines if "/background" in l]
         assert len(bg_line) == 1
         assert "/bg" in bg_line[0]
+
+    def test_includes_todo_gateway_command(self):
+        lines = gateway_help_lines()
+        joined = "\n".join(lines)
+
+        assert "`/todo" in joined
+        assert "[list|add|done|update]" in joined
 
 
 class TestTelegramBotCommands:

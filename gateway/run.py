@@ -4052,6 +4052,15 @@ class GatewayRunner:
                 self._pending_messages[_quick_key] = event.text
             return None
 
+        # Treat plain "todo ..." as the gateway TODO command too. This is
+        # intentionally narrow so ordinary prose is unaffected, while Discord
+        # users can type the natural mobile-friendly form "todo list" without
+        # relying on slash-command sync.
+        if isinstance(event.text, str):
+            _todo_plain = event.text.strip()
+            if re.match(r"(?i)^todo(?:\s+|$)", _todo_plain):
+                event.text = f"/{_todo_plain}"
+
         # Check for commands
         command = event.get_command()
 
@@ -4354,7 +4363,17 @@ class GatewayRunner:
                         )
             except Exception as e:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
-        
+        # /todo is a gateway command that intentionally routes to the agent,
+        # but make the intent explicit so the model reliably calls the todo
+        # tool instead of treating the slash text as ordinary prose.
+        if canonical == "todo":
+            todo_args = event.get_command_args().strip()
+            if not todo_args or todo_args.lower() in {"list", "ls", "show"}:
+                event.text = "Read and show the current todo list using the todo tool."
+            else:
+                event.text = f"Use the todo tool to handle this request: {todo_args}"
+            command = None
+
         # Pending exec approvals are handled by /approve and /deny commands above.
         # No bare text matching — "yes" in normal conversation must not trigger
         # execution of a dangerous command.
@@ -10269,7 +10288,21 @@ class GatewayRunner:
         # Bridge sync status_callback → async adapter.send for context pressure
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
-        _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+
+        def _progress_metadata(*, lifecycle_buttons: bool = False) -> dict | None:
+            """Metadata for non-final progress/status messages.
+
+            Discord final-response controls (close/continue/issue/later) are useful
+            on the final answer, but they make interim status pings such as
+            "Still working..." visually noisy and can hide the actual progress in
+            mobile clients.  Suppress them for all progress-style sends.
+            """
+            meta = {"thread_lifecycle_buttons": lifecycle_buttons}
+            if _progress_thread_id:
+                meta["thread_id"] = _progress_thread_id
+            return meta
+
+        _status_thread_metadata = _progress_metadata(lifecycle_buttons=False)
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -10413,7 +10446,7 @@ class GatewayRunner:
                             adapter=_adapter,
                             chat_id=source.chat_id,
                             config=_consumer_cfg,
-                            metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
+                            metadata=_status_thread_metadata,
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:

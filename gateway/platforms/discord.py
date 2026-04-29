@@ -530,6 +530,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
         self._thread_lifecycle_persistent_view_registered: bool = False
+        self._news_article_persistent_view_registered: bool = False
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -648,6 +649,21 @@ class DiscordAdapter(BasePlatformAdapter):
                         adapter_self._thread_lifecycle_persistent_view_registered = True
                     except Exception as e:
                         logger.debug("Could not register Discord thread lifecycle persistent view: %s", e)
+
+                # Register persistent news article feedback buttons as well.
+                if (
+                    not adapter_self._news_article_persistent_view_registered
+                    and adapter_self._news_article_buttons_enabled()
+                ):
+                    try:
+                        adapter_self._client.add_view(
+                            NewsArticleFeedbackView(
+                                allowed_user_ids=adapter_self._allowed_user_ids,
+                            )
+                        )
+                        adapter_self._news_article_persistent_view_registered = True
+                    except Exception as e:
+                        logger.debug("Could not register Discord news article persistent view: %s", e)
 
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
                     adapter_self._post_connect_task.cancel()
@@ -851,12 +867,22 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning("[%s] Slash command sync failed: %s", self.name, e, exc_info=True)
 
     def _get_discord_command_sync_policy(self) -> str:
-        raw = str(os.getenv("DISCORD_COMMAND_SYNC_POLICY", "safe") or "").strip().lower()
+        """Return slash-command sync policy.
+
+        Environment wins for one-off debugging, but normal gateway installs can
+        keep this in config.yaml under ``discord.command_sync_policy``.  This is
+        useful for high-churn Discord bots where global command reconciliation
+        may hit long Discord-side 429s during every gateway restart.
+        """
+        raw = os.getenv("DISCORD_COMMAND_SYNC_POLICY")
+        if raw is None:
+            raw = self.config.extra.get("command_sync_policy", "safe")
+        raw = str(raw or "").strip().lower()
         if raw in _DISCORD_COMMAND_SYNC_POLICIES:
             return raw
         if raw:
             logger.warning(
-                "[%s] Invalid DISCORD_COMMAND_SYNC_POLICY=%r; falling back to 'safe'",
+                "[%s] Invalid Discord command sync policy=%r; falling back to 'safe'",
                 self.name,
                 raw,
             )
@@ -1092,6 +1118,14 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
+            if metadata is not None and not isinstance(metadata, dict):
+                logger.debug(
+                    "[%s] Ignoring non-dict Discord send metadata: %s",
+                    self.name,
+                    type(metadata).__name__,
+                )
+                metadata = None
+
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
             if metadata and metadata.get("thread_id"):
@@ -1138,7 +1172,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
-                view = self._build_thread_lifecycle_view(channel) if i == len(chunks) - 1 else None
+                view = self._build_message_action_view(channel, metadata) if i == len(chunks) - 1 else None
                 try:
                     msg = await channel.send(
                         content=chunk,
@@ -1189,8 +1223,77 @@ class DiscordAdapter(BasePlatformAdapter):
             return raw.lower() not in ("false", "0", "no", "off")
         return bool(raw)
 
-    def _build_thread_lifecycle_view(self, channel: Any):
-        """Build the 4-button thread cleanup view for Discord thread replies."""
+    def _news_article_buttons_enabled(self) -> bool:
+        """Return whether news-channel messages should include article feedback buttons."""
+        raw = self.config.extra.get("news_article_buttons", True)
+        if isinstance(raw, str):
+            return raw.lower() not in ("false", "0", "no", "off")
+        return bool(raw)
+
+    def _news_article_button_channel_ids(self) -> set[str]:
+        """Configured Discord channels that should receive article feedback buttons."""
+        raw = self.config.extra.get("news_article_button_channels")
+        if raw is None:
+            raw = self.config.extra.get("news_channels")
+        if raw is None:
+            raw = [
+                "1498745024853053501",  # ai-news
+                "1498746404229611660",  # business-news
+                "1498746524480573581",  # sports-news
+                "1498746762595274772",  # f1-news
+                "1498746852378542353",  # football-news
+                "1498746917151182938",  # outings-news
+                "1498748157591556126",  # general news/category-crossing summaries
+            ]
+        if isinstance(raw, str):
+            raw = [part.strip() for part in raw.split(",") if part.strip()]
+        if not isinstance(raw, (list, tuple, set)):
+            return set()
+        return {str(item).strip() for item in raw if str(item).strip()}
+
+    def _is_news_article_channel(self, channel: Any, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        if metadata and metadata.get("news_article_buttons") is False:
+            return False
+        if metadata and metadata.get("news_article_buttons") is True:
+            return True
+        channel_ids = self._news_article_button_channel_ids()
+        if not channel_ids:
+            return False
+        channel_id = str(getattr(channel, "id", "") or "")
+        parent_id = str(getattr(getattr(channel, "parent", None), "id", "") or "")
+        return channel_id in channel_ids or parent_id in channel_ids
+
+    def _build_news_article_view(self, channel: Any, metadata: Optional[Dict[str, Any]] = None):
+        """Build the per-article feedback buttons used in news channels.
+
+        The buttons add reactions to the article message.  That keeps the
+        downstream personalization signal compatible with existing
+        reaction/stamp-based workflows while making the user action one tap.
+        """
+        if not DISCORD_AVAILABLE or not self._news_article_buttons_enabled():
+            return None
+        if isinstance(channel, discord.Thread):
+            return None
+        if not self._is_news_article_channel(channel, metadata):
+            return None
+        return NewsArticleFeedbackView(allowed_user_ids=self._allowed_user_ids)
+
+    def _build_message_action_view(self, channel: Any, metadata: Optional[Dict[str, Any]] = None):
+        """Build a Discord button view for the final chunk of a sent message."""
+        news_view = self._build_news_article_view(channel, metadata)
+        if news_view is not None:
+            return news_view
+        return self._build_thread_lifecycle_view(channel, metadata)
+
+    def _build_thread_lifecycle_view(self, channel: Any, metadata: Optional[Dict[str, Any]] = None):
+        """Build the 4-button thread cleanup view for final Discord thread replies.
+
+        Progress/status/commentary sends can pass ``thread_lifecycle_buttons=False``
+        in metadata so the thread does not get a large button row under every
+        interim update.
+        """
+        if metadata and metadata.get("thread_lifecycle_buttons") is False:
+            return None
         if not DISCORD_AVAILABLE or not self._thread_lifecycle_buttons_enabled():
             return None
         if not isinstance(channel, discord.Thread):
@@ -3836,6 +3939,75 @@ class DiscordAdapter(BasePlatformAdapter):
 
 if DISCORD_AVAILABLE:
 
+    class NewsArticleFeedbackView(discord.ui.View):
+        """One-tap per-article feedback controls for Discord news posts."""
+
+        FEEDBACK_REACTIONS = {
+            "read": "✅",
+            "keep": "⭐",
+            "skip": "👎",
+            "deep": "🧵",
+        }
+
+        def __init__(self, allowed_user_ids: set):
+            super().__init__(timeout=None)
+            self.allowed_user_ids = allowed_user_ids
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            if not self.allowed_user_ids:
+                return True
+            return str(interaction.user.id) in self.allowed_user_ids
+
+        async def _deny_if_unauthorized(self, interaction: discord.Interaction) -> bool:
+            if self._check_auth(interaction):
+                return False
+            await interaction.response.send_message("このボタンを使う権限がないみたいです〜", ephemeral=True)
+            return True
+
+        async def _mark(self, interaction: discord.Interaction, key: str, label: str) -> None:
+            if await self._deny_if_unauthorized(interaction):
+                return
+            message = getattr(interaction, "message", None)
+            if message is None:
+                await interaction.response.send_message("対象の記事メッセージが見つかりませんでした〜", ephemeral=True)
+                return
+
+            # Acknowledge the component interaction before doing Discord-side work.
+            # Adding reactions can be rate-limited or otherwise slow; if we wait for
+            # it before responding, Discord shows the user "This interaction failed".
+            await interaction.response.defer(ephemeral=True, thinking=False)
+
+            emoji = self.FEEDBACK_REACTIONS[key]
+            try:
+                await message.add_reaction(emoji)
+                await interaction.followup.send(f"{emoji} {label} として記録しました〜", ephemeral=True)
+            except Exception as exc:
+                await interaction.followup.send(f"記録に失敗しました: {exc}", ephemeral=True)
+
+        async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+            logger.exception("News article feedback button failed: item=%s", item, exc_info=error)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("ボタン処理でエラーになりました〜", ephemeral=True)
+            else:
+                await interaction.followup.send("ボタン処理でエラーになりました〜", ephemeral=True)
+
+        @discord.ui.button(label="読んだ", style=discord.ButtonStyle.green, emoji="✅", custom_id="news_article_read")
+        async def read_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "read", "読んだ")
+
+        @discord.ui.button(label="継続/もっと", style=discord.ButtonStyle.blurple, emoji="⭐", custom_id="news_article_keep")
+        async def keep_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "keep", "興味あり")
+
+        @discord.ui.button(label="減らす", style=discord.ButtonStyle.grey, emoji="👎", custom_id="news_article_skip")
+        async def skip_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "skip", "減らす候補")
+
+        @discord.ui.button(label="深掘り", style=discord.ButtonStyle.grey, emoji="🧵", custom_id="news_article_deep")
+        async def deep_dive_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "deep", "深掘り候補")
+
+
     class ThreadLifecycleView(discord.ui.View):
         """Four quick cleanup actions for normal Hermes Discord thread replies."""
 
@@ -3889,6 +4061,7 @@ if DISCORD_AVAILABLE:
             thread = await self._thread(interaction)
             if not thread:
                 return
+            await interaction.response.defer(ephemeral=True, thinking=False)
             try:
                 name = getattr(thread, "name", "") or ""
                 new_name = name if name.startswith("継続:") else f"継続: {name}"[:100]
@@ -3898,9 +4071,9 @@ if DISCORD_AVAILABLE:
                     auto_archive_duration=self.keep_archive_minutes,
                     reason=f"Kept by {interaction.user.display_name} via Hermes button",
                 )
-                await interaction.response.send_message("📌 継続扱いにして、自動アーカイブを延長しました〜", ephemeral=True)
+                await interaction.followup.send("📌 継続扱いにして、自動アーカイブを延長しました〜", ephemeral=True)
             except Exception as exc:
-                await interaction.response.send_message(f"継続設定に失敗しました: {exc}", ephemeral=True)
+                await interaction.followup.send(f"継続設定に失敗しました: {exc}", ephemeral=True)
 
         async def _dispatch_agent_request(self, interaction: discord.Interaction, text: str) -> None:
             thread = getattr(interaction, "channel", None)
