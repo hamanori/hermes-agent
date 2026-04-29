@@ -67,6 +67,7 @@ def make_restart_runner(
     runner._draining = False
     runner._restart_requested = False
     runner._restart_task_started = False
+    runner._restart_deferred_until_idle = False
     runner._restart_detached = False
     runner._restart_via_service = False
     runner._restart_drain_timeout = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -110,6 +111,15 @@ def make_restart_runner(
         runner, GatewayRunner
     )
     runner._running_agent_count = GatewayRunner._running_agent_count.__get__(
+        runner, GatewayRunner
+    )
+    runner._start_restart_task = GatewayRunner._start_restart_task.__get__(
+        runner, GatewayRunner
+    )
+    runner._maybe_start_deferred_restart = GatewayRunner._maybe_start_deferred_restart.__get__(
+        runner, GatewayRunner
+    )
+    runner._release_running_agent_state = GatewayRunner._release_running_agent_state.__get__(
         runner, GatewayRunner
     )
     runner._snapshot_running_agents = GatewayRunner._snapshot_running_agents.__get__(

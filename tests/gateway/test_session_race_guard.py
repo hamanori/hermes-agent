@@ -193,6 +193,7 @@ async def test_second_message_during_sentinel_queued_not_duplicate():
         await task1
 
 
+
 def test_merge_pending_message_event_merges_text_and_photo_followups():
     pending = {}
     source = SessionSource(
@@ -507,3 +508,34 @@ async def test_shutdown_skips_sentinel():
     # Real agent should have been interrupted
     real_agent.interrupt.assert_called_once()
     # Should not have raised on the sentinel
+
+
+@pytest.mark.asyncio
+async def test_different_sessions_run_without_global_concurrency_cap():
+    """Different sessions should run concurrently; only same-session overlap is guarded."""
+    runner = _make_runner()
+
+    started = []
+    release = asyncio.Event()
+
+    async def slow_inner(self_inner, ev, src, qk, generation):
+        started.append(qk)
+        await release.wait()
+        return qk
+
+    events = [
+        _make_event(text="hello", chat_id="1"),
+        _make_event(text="hello", chat_id="2"),
+        _make_event(text="hello", chat_id="3"),
+    ]
+
+    with patch.object(GatewayRunner, "_handle_message_with_agent", slow_inner):
+        tasks = [asyncio.create_task(runner._handle_message(event)) for event in events]
+        await asyncio.sleep(0.05)
+
+        assert sorted(started) == sorted(build_session_key(event.source) for event in events)
+
+        release.set()
+        results = await asyncio.gather(*tasks)
+
+    assert sorted(results) == sorted(build_session_key(event.source) for event in events)

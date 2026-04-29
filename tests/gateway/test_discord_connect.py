@@ -584,6 +584,25 @@ async def test_post_connect_initialization_skips_same_fingerprint_after_success(
 
 
 @pytest.mark.asyncio
+async def test_post_connect_initialization_skips_sync_when_config_policy_off(monkeypatch):
+    monkeypatch.delenv("DISCORD_COMMAND_SYNC_POLICY", raising=False)
+    adapter = DiscordAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="test-token",
+            extra={"command_sync_policy": "off"},
+        )
+    )
+
+    fake_tree = SimpleNamespace(sync=AsyncMock())
+    adapter._client = SimpleNamespace(tree=fake_tree)
+
+    await adapter._run_post_connect_initialization()
+
+    fake_tree.sync.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_post_connect_initialization_respects_discord_retry_after(tmp_path, monkeypatch):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
@@ -602,6 +621,7 @@ async def test_post_connect_initialization_respects_discord_retry_after(tmp_path
         application_id=999,
         user=SimpleNamespace(id=999),
     )
+
     class _DiscordRateLimit(RuntimeError):
         retry_after = 123.0
 

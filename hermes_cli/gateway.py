@@ -2653,26 +2653,46 @@ def launchd_stop():
     _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
     print("✓ Service stopped")
 
-def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.0) -> bool:
-    """Wait for the gateway process (by saved PID) to exit.
+def _wait_for_gateway_exit(
+    timeout: float = 10.0,
+    force_after: float | None = 5.0,
+    *,
+    target_pid: int | None = None,
+) -> bool:
+    """Wait for a gateway process to exit.
 
-    Uses the PID from the gateway.pid file — not launchd labels — so this
-    works correctly when multiple gateway instances run under separate
-    HERMES_HOME directories.
+    By default this watches the current PID file for compatibility with older
+    callers.  When restarting a launchd-managed gateway, pass the PID that was
+    signalled.  launchd may respawn a replacement quickly and update the PID
+    file before this helper wakes up; watching the PID file alone then mistakes
+    the new healthy gateway for the old draining one and waits until the full
+    drain timeout.
 
     Args:
         timeout: Total seconds to wait before giving up.
         force_after: Seconds of graceful waiting before escalating to force-kill.
+        target_pid: Specific PID to wait on instead of following gateway.pid.
     """
     import time
     from gateway.status import get_running_pid
+
+    def _current_pid() -> int | None:
+        if target_pid is not None:
+            try:
+                os.kill(target_pid, 0)
+                return target_pid
+            except ProcessLookupError:
+                return None
+            except PermissionError:
+                return target_pid
+        return get_running_pid()
 
     deadline = time.monotonic() + timeout
     force_deadline = (time.monotonic() + force_after) if force_after is not None else None
     force_sent = False
 
     while time.monotonic() < deadline:
-        pid = get_running_pid()
+        pid = _current_pid()
         if pid is None:
             return True  # Process exited cleanly.
 
@@ -2688,7 +2708,7 @@ def _wait_for_gateway_exit(timeout: float = 10.0, force_after: float | None = 5.
         time.sleep(0.3)
 
     # Timed out even after force-kill.
-    remaining_pid = get_running_pid()
+    remaining_pid = _current_pid()
     if remaining_pid is not None:
         print(f"⚠ Gateway PID {remaining_pid} still running after {timeout}s — restart may fail")
         return False
@@ -2703,6 +2723,22 @@ def launchd_restart():
 
     try:
         pid = get_running_pid()
+        if pid is not None and _is_pid_ancestor_of_current_process(pid):
+            # This CLI is running inside the gateway itself (for example via a
+            # Discord-triggered terminal tool).  Requesting a self-restart here
+            # marks the gateway as restarting while the current agent turn is
+            # still active, so follow-up messages get stuck behind the draining
+            # guard until this very turn finishes.  Gateway-native /restart and
+            # external terminal restarts remain supported; avoid self-restart
+            # from inside agent work unless explicitly opted in by a developer.
+            if os.getenv("HERMES_ALLOW_IN_PROCESS_GATEWAY_RESTART", "").lower() not in (
+                "1", "true", "yes"
+            ):
+                print(
+                    "⚠ Refusing to restart gateway from inside an active gateway task; "
+                    "run `hermes gateway restart` from an external terminal or use /restart."
+                )
+                return
         if pid is not None and _request_gateway_self_restart(pid):
             print("✓ Service restart requested")
             return
@@ -2712,7 +2748,11 @@ def launchd_restart():
             except (ProcessLookupError, PermissionError, OSError):
                 pid = None
             if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
+                exited = _wait_for_gateway_exit(
+                    timeout=drain_timeout,
+                    force_after=None,
+                    target_pid=pid,
+                )
                 if not exited:
                     print(f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart")
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)

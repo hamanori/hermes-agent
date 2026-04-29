@@ -85,6 +85,25 @@ class TestCleanForDisplay:
         assert result == text
 
 
+# ── Streaming send metadata ───────────────────────────────────────────────
+
+
+def test_streaming_metadata_suppresses_thread_lifecycle_buttons():
+    consumer = GatewayStreamConsumer(
+        MagicMock(),
+        "chat_1",
+        metadata={"thread_id": "thread_1", "other": "kept"},
+    )
+
+    meta = consumer._metadata_without_thread_lifecycle_buttons()
+
+    assert meta == {
+        "thread_id": "thread_1",
+        "other": "kept",
+        "thread_lifecycle_buttons": False,
+    }
+
+
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────
 
 

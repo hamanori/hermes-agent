@@ -528,6 +528,12 @@ class GatewayStreamConsumer:
         # Strip trailing whitespace/newlines but preserve leading content
         return cleaned.rstrip()
 
+    def _metadata_without_thread_lifecycle_buttons(self) -> dict:
+        """Metadata for interim/streaming sends that should not show thread cleanup buttons."""
+        meta = dict(self.metadata) if self.metadata else {}
+        meta["thread_lifecycle_buttons"] = False
+        return meta
+
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str]) -> Optional[str]:
         """Send a new message chunk, optionally threaded to a previous message.
 
@@ -537,7 +543,7 @@ class GatewayStreamConsumer:
         if not text.strip():
             return reply_to_id
         try:
-            meta = dict(self.metadata) if self.metadata else {}
+            meta = self._metadata_without_thread_lifecycle_buttons()
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
@@ -650,7 +656,7 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    metadata=self.metadata,
+                    metadata=self._metadata_without_thread_lifecycle_buttons(),
                 )
                 if result.success:
                     break
@@ -725,7 +731,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self.metadata,
+                metadata=self._metadata_without_thread_lifecycle_buttons(),
             )
             if result.success:
                 self._already_sent = True
@@ -762,7 +768,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._metadata_without_thread_lifecycle_buttons(),
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
@@ -814,7 +820,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._metadata_without_thread_lifecycle_buttons(),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -983,7 +989,7 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=text,
-                    metadata=self.metadata,
+                    metadata=self._metadata_without_thread_lifecycle_buttons(),
                 )
                 if result.success:
                     if result.message_id:
