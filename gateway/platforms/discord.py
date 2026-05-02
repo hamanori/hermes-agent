@@ -658,6 +658,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     try:
                         adapter_self._client.add_view(
                             NewsArticleFeedbackView(
+                                adapter=adapter_self,
                                 allowed_user_ids=adapter_self._allowed_user_ids,
                             )
                         )
@@ -1287,7 +1288,7 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
         if not self._is_news_article_channel(channel, metadata):
             return None
-        return NewsArticleFeedbackView(allowed_user_ids=self._allowed_user_ids)
+        return NewsArticleFeedbackView(adapter=self, allowed_user_ids=self._allowed_user_ids)
 
     def _build_message_action_view(self, channel: Any, metadata: Optional[Dict[str, Any]] = None):
         """Build a Discord button view for the final chunk of a sent message."""
@@ -3960,9 +3961,10 @@ if DISCORD_AVAILABLE:
             "deep": "🧵",
         }
 
-        def __init__(self, allowed_user_ids: set):
+        def __init__(self, allowed_user_ids: set, adapter=None):
             super().__init__(timeout=None)
             self.allowed_user_ids = allowed_user_ids
+            self.adapter = adapter
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             if not self.allowed_user_ids:
@@ -3974,6 +3976,139 @@ if DISCORD_AVAILABLE:
                 return False
             await interaction.response.send_message("このボタンを使う権限がないみたいです〜", ephemeral=True)
             return True
+
+        def _extract_article_url(self, message) -> str | None:
+            import re
+
+            content = getattr(message, "content", "") or ""
+            urls = re.findall(r"https?://[^\s)]+", content)
+            if urls:
+                return urls[0].rstrip('>.,)\"]}')
+            embeds = getattr(message, "embeds", None) or []
+            for embed in embeds:
+                url = getattr(embed, "url", None)
+                if url:
+                    return str(url)
+                footer = getattr(embed, "footer", None)
+                if footer:
+                    footer_text = getattr(footer, "text", None)
+                    if footer_text:
+                        urls = re.findall(r"https?://[^\s)]+", footer_text)
+                        if urls:
+                            return urls[0].rstrip('>.,)\"]}')
+            return None
+
+        def _article_title(self, message) -> str:
+            import re
+
+            content = getattr(message, "content", "") or ""
+            first_line = next((line.strip() for line in content.splitlines() if line.strip()), "")
+            first_line = re.sub(r"^\s*\d+\.\s*", "", first_line)
+            first_line = re.sub(r"\*\*(.*?)\*\*", r"\1", first_line)
+            first_line = re.sub(r"https?://\S+", "", first_line)
+            first_line = re.sub(r"[#*_`>\[\]()]", "", first_line)
+            first_line = re.sub(r"\s+", " ", first_line).strip(" -:：")
+            return first_line or "ニュース深掘り"
+
+        def _deep_dive_thread_name(self, message) -> str:
+            title = self._article_title(message)
+            name = title if title.startswith("深掘り:") else f"深掘り: {title}"
+            return name[:100]
+
+        def _deep_dive_prompt(self, message) -> str:
+            content = (getattr(message, "content", "") or "").strip()
+            url = self._extract_article_url(message)
+            lines = [
+                "このニュース記事の詳細版スレッドとして深掘りしてください。",
+                "",
+                "やってほしいこと:",
+                "- 元記事と関連情報を確認し、何が起きたかを整理する",
+                "- 背景、重要性、ユーザーが次に見るべき観点を分けて説明する",
+                "- 追加で追うべき一次情報・公式発表・信頼できる続報があれば挙げる",
+                "- 日本語で、Discord で読みやすい粒度にする",
+            ]
+            if url:
+                lines.extend(["", f"元記事URL: {url}"])
+            if content:
+                lines.extend(["", "元のニュース項目:", content[:1800]])
+            return "\n".join(lines)
+
+        async def _create_deep_dive_thread(self, interaction: discord.Interaction, message) -> str | None:
+            if self.adapter is None:
+                return None
+
+            thread_name = self._deep_dive_thread_name(message)
+            reason = f"Deep Dive requested by {interaction.user.display_name} via Hermes news button"
+            try:
+                thread = await message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=10080,
+                    reason=reason,
+                )
+            except Exception as direct_error:
+                channel = getattr(interaction, "channel", None) or getattr(message, "channel", None)
+                try:
+                    thread = await channel.create_thread(
+                        name=thread_name,
+                        auto_archive_duration=10080,
+                        reason=reason,
+                    )
+                    await thread.send(f"🧵 Deep Dive requested from: {getattr(message, 'jump_url', '')}")
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        "スレッド作成に失敗しました。"
+                        f" direct={direct_error}; fallback={fallback_error}"
+                    ) from fallback_error
+
+            thread_id = str(getattr(thread, "id", "") or "")
+            thread_name = getattr(thread, "name", None) or thread_name
+            if thread_id:
+                self.adapter._threads.mark(thread_id)
+
+            prompt = self._deep_dive_prompt(message)
+            asyncio.create_task(
+                self.adapter._dispatch_thread_session(
+                    interaction,
+                    thread_id,
+                    thread_name,
+                    prompt,
+                )
+            )
+            return f"<#{thread_id}>" if thread_id else f"**{thread_name}**"
+
+        def _persist_news_feedback(self, interaction: discord.Interaction, key: str, label: str, emoji: str) -> None:
+            try:
+                from hermes_constants import get_hermes_home
+                import json as _json
+                from datetime import datetime, timezone
+                from pathlib import Path
+
+                home = get_hermes_home()
+                state_dir = home / "state"
+                state_dir.mkdir(parents=True, exist_ok=True)
+                log_path = state_dir / "news_feedback.jsonl"
+                message = getattr(interaction, "message", None)
+                channel = getattr(interaction, "channel", None)
+                record = {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "reaction": key,
+                    "reaction_label": label,
+                    "reaction_emoji": emoji,
+                    "guild_id": str(getattr(getattr(interaction, "guild", None), "id", "") or ""),
+                    "channel_id": str(getattr(channel, "id", "") or ""),
+                    "thread_id": str(getattr(channel, "id", "") or "") if isinstance(channel, discord.Thread) else None,
+                    "message_id": str(getattr(message, "id", "") or ""),
+                    "user_id": str(getattr(getattr(interaction, "user", None), "id", "") or ""),
+                    "user_name": getattr(getattr(interaction, "user", None), "display_name", None),
+                    "job_name": getattr(self, "job_name", None),
+                    "topic": getattr(self, "topic", None),
+                    "article_url": self._extract_article_url(message) if message else None,
+                    "article_title": getattr(message, "content", "")[:500] if message else None,
+                }
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(_json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception:
+                logger.exception("Failed to persist news feedback event")
 
         async def _mark(self, interaction: discord.Interaction, key: str, label: str) -> None:
             if await self._deny_if_unauthorized(interaction):
@@ -3991,7 +4126,21 @@ if DISCORD_AVAILABLE:
             emoji = self.FEEDBACK_REACTIONS[key]
             try:
                 await message.add_reaction(emoji)
-                await interaction.followup.send(f"{emoji} {label} として記録しました〜", ephemeral=True)
+                self._persist_news_feedback(interaction, key, label, emoji)
+                if key == "deep":
+                    link = await self._create_deep_dive_thread(interaction, message)
+                    if link:
+                        await interaction.followup.send(
+                            f"{emoji} Deep Dive として記録して、詳細スレッド {link} を作りました〜",
+                            ephemeral=True,
+                        )
+                    else:
+                        await interaction.followup.send(
+                            f"{emoji} Deep Dive として記録しました。詳細スレッド作成は利用できません〜",
+                            ephemeral=True,
+                        )
+                else:
+                    await interaction.followup.send(f"{emoji} {label} として記録しました〜", ephemeral=True)
             except Exception as exc:
                 await interaction.followup.send(f"記録に失敗しました: {exc}", ephemeral=True)
 
@@ -4002,25 +4151,25 @@ if DISCORD_AVAILABLE:
             else:
                 await interaction.followup.send("ボタン処理でエラーになりました〜", ephemeral=True)
 
-        @discord.ui.button(label="読んだ", style=discord.ButtonStyle.green, emoji="✅", custom_id="news_article_read")
+        @discord.ui.button(label="Read", style=discord.ButtonStyle.green, emoji="✅", custom_id="news_article_read")
         async def read_article(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await self._mark(interaction, "read", "読んだ")
+            await self._mark(interaction, "read", "Read")
 
-        @discord.ui.button(label="継続/もっと", style=discord.ButtonStyle.blurple, emoji="⭐", custom_id="news_article_keep")
+        @discord.ui.button(label="More", style=discord.ButtonStyle.blurple, emoji="⭐", custom_id="news_article_keep")
         async def keep_article(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await self._mark(interaction, "keep", "興味あり")
+            await self._mark(interaction, "keep", "More")
 
-        @discord.ui.button(label="減らす", style=discord.ButtonStyle.grey, emoji="👎", custom_id="news_article_skip")
+        @discord.ui.button(label="Less", style=discord.ButtonStyle.grey, emoji="👎", custom_id="news_article_skip")
         async def skip_article(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await self._mark(interaction, "skip", "減らす候補")
+            await self._mark(interaction, "skip", "Less")
 
-        @discord.ui.button(label="深掘り", style=discord.ButtonStyle.grey, emoji="🧵", custom_id="news_article_deep")
+        @discord.ui.button(label="Deep Dive", style=discord.ButtonStyle.grey, emoji="🧵", custom_id="news_article_deep")
         async def deep_dive_article(self, interaction: discord.Interaction, button: discord.ui.Button):
-            await self._mark(interaction, "deep", "深掘り候補")
+            await self._mark(interaction, "deep", "Deep Dive")
 
 
     class ThreadLifecycleView(discord.ui.View):
-        """Four quick cleanup actions for normal Hermes Discord thread replies."""
+        """Seven quick cleanup/summary actions for normal Hermes Discord thread replies."""
 
         def __init__(self, adapter, allowed_user_ids: set, keep_archive_minutes: int = 10080):
             super().__init__(timeout=None)
@@ -4051,7 +4200,7 @@ if DISCORD_AVAILABLE:
                 if getattr(child, "custom_id", "") == "thread_lifecycle_close":
                     child.disabled = True
 
-        @discord.ui.button(label="完了して閉じる", style=discord.ButtonStyle.green, emoji="✅", custom_id="thread_lifecycle_close")
+        @discord.ui.button(style=discord.ButtonStyle.green, emoji="✅", custom_id="thread_lifecycle_close", row=0)
         async def close_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
             if await self._deny_if_unauthorized(interaction):
                 return
@@ -4065,7 +4214,7 @@ if DISCORD_AVAILABLE:
             except Exception as exc:
                 await interaction.followup.send(f"閉じるのに失敗しました: {exc}", ephemeral=True)
 
-        @discord.ui.button(label="継続する", style=discord.ButtonStyle.blurple, emoji="📌", custom_id="thread_lifecycle_keep")
+        @discord.ui.button(style=discord.ButtonStyle.blurple, emoji="📌", custom_id="thread_lifecycle_keep", row=0)
         async def keep_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
             if await self._deny_if_unauthorized(interaction):
                 return
@@ -4085,6 +4234,37 @@ if DISCORD_AVAILABLE:
                 await interaction.followup.send("📌 継続扱いにして、自動アーカイブを延長しました〜", ephemeral=True)
             except Exception as exc:
                 await interaction.followup.send(f"継続設定に失敗しました: {exc}", ephemeral=True)
+
+        async def _resume_thread_action(self, interaction: discord.Interaction) -> None:
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            await interaction.response.defer(ephemeral=True, thinking=False)
+            try:
+                name = getattr(thread, "name", "") or ""
+                if name.startswith("継続:"):
+                    name = name.removeprefix("継続:").strip()
+                new_name = f"継続: {name}" if name else "継続"
+                await thread.edit(
+                    name=new_name[:100],
+                    archived=False,
+                    auto_archive_duration=self.keep_archive_minutes,
+                    reason=f"Resumed by {interaction.user.display_name} via Hermes button",
+                )
+                await interaction.followup.send("🔄 続きから応答します〜", ephemeral=True)
+                await self._dispatch_agent_request(
+                    interaction,
+                    "このスレッドの直前の文脈を読んで、止まっていた続きの応答をしてください。"
+                    "新しい依頼を作り直すのではなく、未完了の回答・作業・確認があればそこから再開してください。",
+                )
+            except Exception as exc:
+                await interaction.followup.send(f"再開に失敗しました: {exc}", ephemeral=True)
+
+        @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="🔄", custom_id="thread_lifecycle_resume", row=0)
+        async def resume_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._resume_thread_action(interaction)
 
         async def _dispatch_agent_request(self, interaction: discord.Interaction, text: str) -> None:
             thread = getattr(interaction, "channel", None)
@@ -4115,7 +4295,7 @@ if DISCORD_AVAILABLE:
             )
             asyncio.create_task(self.adapter.handle_message(event))
 
-        @discord.ui.button(label="Issue化する", style=discord.ButtonStyle.grey, emoji="📝", custom_id="thread_lifecycle_issue")
+        @discord.ui.button(style=discord.ButtonStyle.grey, emoji="📝", custom_id="thread_lifecycle_issue", row=1)
         async def create_issue_hint(self, interaction: discord.Interaction, button: discord.ui.Button):
             if await self._deny_if_unauthorized(interaction):
                 return
@@ -4128,17 +4308,43 @@ if DISCORD_AVAILABLE:
                 "このスレッドの内容を要約して GitHub Issue にしてください。作成後、このスレッドは閉じる候補にしてください。",
             )
 
-        @discord.ui.button(label="あとで整理", style=discord.ButtonStyle.grey, emoji="🗂", custom_id="thread_lifecycle_later")
+        @discord.ui.button(style=discord.ButtonStyle.grey, emoji="💡", custom_id="thread_lifecycle_later", row=1)
         async def organize_later_hint(self, interaction: discord.Interaction, button: discord.ui.Button):
             if await self._deny_if_unauthorized(interaction):
                 return
             thread = await self._thread(interaction)
             if not thread:
                 return
-            await interaction.response.send_message("🗂 あとで整理を始めますね〜", ephemeral=True)
+            await interaction.response.send_message("💡 アイデアとして整理しますね〜", ephemeral=True)
             await self._dispatch_agent_request(
                 interaction,
-                "このスレッドの内容を Project Life / TODO / メモのどれに送るべきか整理して、必要なら登録してください。",
+                "このスレッドの内容をアイデアとして整理して、必要なら #ideas に送るべきか判断してください。",
+            )
+
+        @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="📚", custom_id="thread_lifecycle_wiki", row=1)
+        async def wiki_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            await interaction.response.send_message("📚 llm-wiki 候補に入れますね〜", ephemeral=True)
+            await self._dispatch_agent_request(
+                interaction,
+                "このスレッドの内容を llm-wiki に書き込む候補として整理してください。知識として残すべき要点、再利用できる事実、注意点を抽出してください。",
+            )
+
+        @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="🧾", custom_id="thread_lifecycle_summary", row=1)
+        async def summarize_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            await interaction.response.send_message("🧾 要約を始めますね〜", ephemeral=True)
+            await self._dispatch_agent_request(
+                interaction,
+                "このスレッドの内容を短く要約して、要点・決定事項・未決事項に分けてまとめてください。",
             )
 
     class ExecApprovalView(discord.ui.View):
