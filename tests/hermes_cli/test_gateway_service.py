@@ -590,6 +590,26 @@ class TestLaunchdServiceRecovery:
         assert "stale" in output.lower()
         assert "not loaded" in output.lower()
 
+    def test_launchd_status_uses_print_target_for_loaded_service(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="state = running\n", stderr="")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        output = capsys.readouterr().out
+        assert calls[0] == ["launchctl", "print", target]
+        assert "service is loaded" in output.lower()
+        assert "state = running" in output
+
 
 class TestGatewayServiceDetection:
     def test_supports_systemd_services_requires_systemctl_binary(self, monkeypatch):
@@ -606,6 +626,24 @@ class TestGatewayServiceDetection:
         monkeypatch.setattr(gateway_cli.shutil, "which", lambda name: "/usr/bin/systemctl")
 
         assert gateway_cli.supports_systemd_services() is True
+
+    def test_is_service_running_uses_launchctl_print_on_macos(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("plist", encoding="utf-8")
+        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return SimpleNamespace(returncode=0, stdout="state = running\n", stderr="")
+
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._is_service_running() is True
+        assert calls == [["launchctl", "print", target]]
 
     def test_is_service_running_checks_system_scope_when_user_scope_is_inactive(self, monkeypatch):
         user_unit = SimpleNamespace(exists=lambda: True)

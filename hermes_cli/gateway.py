@@ -2822,9 +2822,10 @@ def launchd_restart():
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
+    target = f"{_launchd_domain()}/{label}"
     try:
         result = subprocess.run(
-            ["launchctl", "list", label],
+            ["launchctl", "print", target],
             capture_output=True,
             text=True,
             timeout=10,
@@ -3826,8 +3827,9 @@ def _is_service_running() -> bool:
         return False
     elif is_macos() and get_launchd_plist_path().exists():
         try:
+            target = f"{_launchd_domain()}/{get_launchd_label()}"
             result = subprocess.run(
-                ["launchctl", "list", get_launchd_label()],
+                ["launchctl", "print", target],
                 capture_output=True, text=True, timeout=10,
             )
             return result.returncode == 0
