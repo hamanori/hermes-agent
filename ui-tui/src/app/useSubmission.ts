@@ -126,6 +126,9 @@ export function useSubmission(opts: UseSubmissionOptions) {
         return sys('session not ready yet')
       }
 
+      // Always ask the backend whether this looks like a file drop.
+      // The backend's _detect_file_drop handles paths with spaces, quotes,
+      // Windows drive letters, and escaped characters correctly.
       gw.request<InputDetectDropResponse>('input.detect_drop', { session_id: sid, text })
         .then(r => {
           if (!r?.matched) {
@@ -227,6 +230,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
     (full: string, opts: { fallbackToFront?: boolean } = {}) => {
       const live = getUiState()
       const mode = live.busyInputMode
+
       const fallback = (note: string) => {
         if (opts.fallbackToFront) {
           composerRefs.queueRef.current.unshift(full)
@@ -234,6 +238,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
         } else {
           composerActions.enqueue(full)
         }
+
         sys(note)
       }
 
@@ -350,17 +355,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
 
       send(full)
     },
-    [
-      appendMessage,
-      composerActions,
-      composerRefs,
-      handleBusyInput,
-      interpolate,
-      send,
-      sendQueued,
-      shellExec,
-      slashRef
-    ]
+    [appendMessage, composerActions, composerRefs, handleBusyInput, interpolate, send, sendQueued, shellExec, slashRef]
   )
 
   const submit = useCallback(
