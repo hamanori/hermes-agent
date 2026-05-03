@@ -4,7 +4,13 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway.platforms.discord import DISCORD_AVAILABLE, NewsArticleFeedbackView, ThreadLifecycleView
+from gateway.config import PlatformConfig
+from gateway.platforms.discord import (
+    DISCORD_AVAILABLE,
+    DiscordAdapter,
+    NewsArticleFeedbackView,
+    ThreadLifecycleView,
+)
 
 
 @pytest.mark.skipif(not DISCORD_AVAILABLE, reason="discord.py is not installed")
@@ -149,6 +155,61 @@ async def test_deep_dive_button_creates_thread_and_dispatches_agent():
     assert calls[6][0] == "dispatch"
     assert calls[6][1] == "456"
     assert "このニュース記事の詳細版スレッドとして深掘りしてください。" in calls[6][3]
+
+
+@pytest.mark.skipif(not DISCORD_AVAILABLE, reason="discord.py is not installed")
+@pytest.mark.asyncio
+async def test_news_digest_send_attaches_feedback_view_to_each_article():
+    channel_id = "1498745024853053501"
+    config = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"news_article_button_channels": [channel_id]},
+    )
+    adapter = DiscordAdapter(config)
+    sent_messages = []
+
+    async def send_message(**kwargs):
+        sent_messages.append(kwargs)
+        return SimpleNamespace(id=len(sent_messages))
+
+    channel = SimpleNamespace(
+        id=int(channel_id),
+        parent=None,
+        send=send_message,
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _id: channel,
+        fetch_channel=AsyncMock(return_value=channel),
+    )
+
+    content = """AI News digest
+
+1. **First article**
+https://example.com/first
+- why it matters
+
+2. **Second article**
+https://example.com/second
+- why it matters
+
+### SKIP
+- low-signal item
+"""
+
+    result = await adapter.send(channel_id, content)
+
+    assert result.success is True
+    assert [item["content"].splitlines()[0] for item in sent_messages] == [
+        "AI News digest",
+        "1. **First article**",
+        "2. **Second article**",
+        "### SKIP",
+    ]
+    assert sent_messages[0]["view"] is None
+    assert isinstance(sent_messages[1]["view"], NewsArticleFeedbackView)
+    assert isinstance(sent_messages[2]["view"], NewsArticleFeedbackView)
+    assert sent_messages[3]["view"] is None
 
 
 @pytest.mark.skipif(not DISCORD_AVAILABLE, reason="discord.py is not installed")

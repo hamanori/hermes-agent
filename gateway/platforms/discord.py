@@ -1471,7 +1471,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Format and split message if needed
             formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            news_segments = self._split_news_article_messages(formatted, channel, metadata)
 
             message_ids = []
             reference = None
@@ -1486,12 +1486,28 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:
                     logger.debug("Could not fetch reply-to message: %s", e)
 
-            for i, chunk in enumerate(chunks):
+            if news_segments:
+                send_plan: list[tuple[str, bool]] = []
+                for segment_text, attach_article_view in news_segments:
+                    segment_chunks = self.truncate_message(segment_text, self.MAX_MESSAGE_LENGTH)
+                    for idx, chunk in enumerate(segment_chunks):
+                        send_plan.append((chunk, attach_article_view and idx == len(segment_chunks) - 1))
+            else:
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+                send_plan = [(chunk, i == len(chunks) - 1) for i, chunk in enumerate(chunks)]
+
+            for i, (chunk, attach_view) in enumerate(send_plan):
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
-                view = self._build_message_action_view(channel, metadata) if i == len(chunks) - 1 else None
+                view = (
+                    self._build_news_article_view(channel, metadata)
+                    if news_segments and attach_view
+                    else self._build_message_action_view(channel, metadata)
+                    if attach_view
+                    else None
+                )
                 try:
                     msg = await channel.send(
                         content=chunk,
@@ -1534,6 +1550,53 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    def _split_news_article_messages(
+        self,
+        content: str,
+        channel: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[list[tuple[str, bool]]]:
+        """Split a numbered news digest into per-article Discord messages.
+
+        The feedback buttons are article-level controls. A cron digest often
+        arrives as one Markdown response, so split top-level numbered article
+        blocks and attach buttons only to those article messages. Preamble and
+        SKIP/footer text stay buttonless.
+        """
+        if not DISCORD_AVAILABLE or isinstance(channel, discord.Thread):
+            return None
+        if not self._news_article_buttons_enabled():
+            return None
+        if not self._is_news_article_channel(channel, metadata):
+            return None
+
+        starts = list(re.finditer(r"(?m)^\s*(\d+)\.\s+\*\*", content or ""))
+        if len(starts) < 2:
+            return None
+
+        skip_match = re.search(r"(?m)^###\s+SKIP\b", content or "")
+        article_end_limit = skip_match.start() if skip_match else len(content)
+        starts = [m for m in starts if m.start() < article_end_limit]
+        if len(starts) < 2:
+            return None
+
+        segments: list[tuple[str, bool]] = []
+        preamble = content[: starts[0].start()].strip()
+        if preamble:
+            segments.append((preamble, False))
+
+        for idx, match in enumerate(starts):
+            next_start = starts[idx + 1].start() if idx + 1 < len(starts) else article_end_limit
+            article = content[match.start():next_start].strip()
+            if article:
+                segments.append((article, True))
+
+        tail = content[article_end_limit:].strip()
+        if tail:
+            segments.append((tail, False))
+
+        return segments or None
 
     def _thread_lifecycle_buttons_enabled(self) -> bool:
         """Return whether normal Discord thread replies should include cleanup buttons."""
