@@ -1471,6 +1471,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Format and split message if needed
             formatted = self.format_message(content)
+
+            from gateway.markdown_table_images import segment_markdown_tables
+            table_segments = segment_markdown_tables(formatted)
+            table_segments_changed = (
+                len(table_segments) != 1
+                or (table_segments and table_segments[0].content != formatted)
+            )
+
             news_segments = self._split_news_article_messages(formatted, channel, metadata)
 
             message_ids = []
@@ -1486,34 +1494,54 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:
                     logger.debug("Could not fetch reply-to message: %s", e)
 
-            if news_segments:
-                send_plan: list[tuple[str, bool]] = []
+            if table_segments_changed:
+                send_plan: list[tuple[str, str, bool]] = []
+                for segment in table_segments:
+                    if segment.kind == "image":
+                        send_plan.append(("image", segment.content, False))
+                        continue
+                    for chunk in self.truncate_message(segment.content, self.MAX_MESSAGE_LENGTH):
+                        if chunk.strip():
+                            send_plan.append(("text", chunk, False))
+                if send_plan:
+                    last_kind, last_value, _ = send_plan[-1]
+                    send_plan[-1] = (last_kind, last_value, True)
+            elif news_segments:
+                send_plan = []
                 for segment_text, attach_article_view in news_segments:
                     segment_chunks = self.truncate_message(segment_text, self.MAX_MESSAGE_LENGTH)
                     for idx, chunk in enumerate(segment_chunks):
-                        send_plan.append((chunk, attach_article_view and idx == len(segment_chunks) - 1))
+                        send_plan.append(("text", chunk, attach_article_view and idx == len(segment_chunks) - 1))
             else:
                 chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-                send_plan = [(chunk, i == len(chunks) - 1) for i, chunk in enumerate(chunks)]
+                send_plan = [("text", chunk, i == len(chunks) - 1) for i, chunk in enumerate(chunks)]
 
-            for i, (chunk, attach_view) in enumerate(send_plan):
+            for i, (item_kind, item_value, attach_view) in enumerate(send_plan):
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
                 view = (
                     self._build_news_article_view(channel, metadata)
-                    if news_segments and attach_view
+                    if news_segments and attach_view and item_kind == "text"
                     else self._build_message_action_view(channel, metadata)
                     if attach_view
                     else None
                 )
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                        view=view,
-                    )
+                    if item_kind == "image":
+                        with open(item_value, "rb") as image_file:
+                            msg = await channel.send(
+                                file=discord.File(image_file, filename=os.path.basename(item_value)),
+                                reference=chunk_reference,
+                                view=view,
+                            )
+                    else:
+                        msg = await channel.send(
+                            content=item_value,
+                            reference=chunk_reference,
+                            view=view,
+                        )
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -1532,11 +1560,19 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                            view=view,
-                        )
+                        if item_kind == "image":
+                            with open(item_value, "rb") as image_file:
+                                msg = await channel.send(
+                                    file=discord.File(image_file, filename=os.path.basename(item_value)),
+                                    reference=None,
+                                    view=view,
+                                )
+                        else:
+                            msg = await channel.send(
+                                content=item_value,
+                                reference=None,
+                                view=view,
+                            )
                     else:
                         raise
                 message_ids.append(str(msg.id))
