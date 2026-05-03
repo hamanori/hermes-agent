@@ -172,6 +172,82 @@ async def test_registers_native_todo_slash_command_with_text_only(adapter):
 
 
 @pytest.mark.asyncio
+async def test_registers_native_chatgpt_pro_slash_command(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "chatgpt-pro" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["chatgpt-pro"](
+        interaction,
+        prompt="この案をレビューして",
+    )
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction,
+        "/chatgpt-pro この案をレビューして",
+    )
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_pro_slash_without_prompt_sends_usage_hint(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+
+    await adapter._client.tree.commands["chatgpt-pro"](
+        interaction,
+        prompt="",
+    )
+
+    interaction.response.send_message.assert_awaited_once_with(
+        "何を Pro extended thinking で考えさせる？",
+        ephemeral=True,
+    )
+    adapter._run_simple_slash.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_registers_native_chatgpt_research_slash_command(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "chatgpt-research" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["chatgpt-research"](
+        interaction,
+        prompt="競合サービスを調べて",
+    )
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction,
+        "/chatgpt-research 競合サービスを調べて",
+    )
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_research_slash_without_prompt_sends_usage_hint(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+
+    await adapter._client.tree.commands["chatgpt-research"](
+        interaction,
+        prompt=" ",
+    )
+
+    interaction.response.send_message.assert_awaited_once_with(
+        "何を Deep Research で調べる？範囲や出力形式もあれば教えて",
+        ephemeral=True,
+    )
+    adapter._run_simple_slash.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_todo_slash_without_text_sends_usage_hint(adapter):
     interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
 
