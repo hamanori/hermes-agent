@@ -385,6 +385,57 @@ class TestSendToPlatformChunking:
         for call in send.await_args_list:
             assert len(call.args[2]) <= 2020  # each chunk fits the limit
 
+    def test_discord_news_digest_splits_articles_with_components(self):
+        """Standalone Discord delivery mirrors gateway article-level news buttons."""
+        sent = []
+
+        async def send(token, chat_id, message, thread_id=None, media_files=None, components=None):
+            sent.append(
+                {
+                    "chat_id": chat_id,
+                    "message": message,
+                    "thread_id": thread_id,
+                    "media_files": media_files,
+                    "components": components,
+                }
+            )
+            return {"success": True, "message_id": str(len(sent))}
+
+        message = """Cronjob Response: life-business-news-scout
+
+## business/economy ニュースダイジェスト
+
+1. **First article**
+https://example.com/first
+- why it matters
+
+2. **Second article**
+https://example.com/second
+- why it matters
+
+hiroさん、気になったやつは各記事の **Read / More / Less / Deep Dive** ボタンで反応してくれたら助かります。
+"""
+
+        with patch("tools.send_message_tool._send_discord", side_effect=send):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DISCORD,
+                    SimpleNamespace(enabled=True, token="***", extra={}),
+                    "1498746404229611660",
+                    message,
+                )
+            )
+
+        assert result["success"] is True
+        assert [item["message"].splitlines()[0] for item in sent] == [
+            "Cronjob Response: life-business-news-scout",
+            "1. **First article**",
+            "2. **Second article**",
+        ]
+        assert sent[0]["components"] is None
+        assert sent[1]["components"][0]["components"][0]["custom_id"] == "news_article_read"
+        assert sent[2]["components"][0]["components"][3]["custom_id"] == "news_article_deep"
+
     def test_slack_messages_are_formatted_before_send(self, monkeypatch):
         _ensure_slack_mock(monkeypatch)
 
