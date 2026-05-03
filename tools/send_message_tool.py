@@ -47,6 +47,15 @@ _VOICE_EXTS = {".ogg", ".opus"}
 # formats either route through sendVoice (Opus/OGG) or fall back to
 # document delivery.
 _TELEGRAM_SEND_AUDIO_EXTS = {".mp3", ".m4a"}
+_DEFAULT_DISCORD_NEWS_ARTICLE_CHANNEL_IDS = {
+    "1498745024853053501",  # ai-news
+    "1498746404229611660",  # business-news
+    "1498746524480573581",  # sports-news
+    "1498746762595274772",  # f1-news
+    "1498746852378542353",  # football-news
+    "1498746917151182938",  # outings-news
+    "1498748157591556126",  # general news/category-crossing summaries
+}
 _URL_SECRET_QUERY_RE = re.compile(
     r"([?&](?:access_token|api[_-]?key|auth[_-]?token|token|signature|sig)=)([^&#\s]+)",
     re.IGNORECASE,
@@ -68,6 +77,95 @@ def _sanitize_error_text(text) -> str:
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
+
+
+def _discord_news_article_button_channel_ids(pconfig) -> set[str]:
+    extra = getattr(pconfig, "extra", None) or {}
+    raw = extra.get("news_article_button_channels")
+    if raw is None:
+        raw = extra.get("news_channels")
+    if raw is None:
+        return set(_DEFAULT_DISCORD_NEWS_ARTICLE_CHANNEL_IDS)
+    if isinstance(raw, str):
+        raw = [part.strip() for part in raw.split(",") if part.strip()]
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    return {str(item).strip() for item in raw if str(item).strip()}
+
+
+def _discord_news_article_buttons_enabled(pconfig) -> bool:
+    extra = getattr(pconfig, "extra", None) or {}
+    raw = extra.get("news_article_buttons", True)
+    if isinstance(raw, str):
+        return raw.lower() not in ("false", "0", "no", "off")
+    return bool(raw)
+
+
+def _discord_news_article_components() -> list[dict]:
+    return [
+        {
+            "type": 1,
+            "components": [
+                {
+                    "type": 2,
+                    "style": 3,
+                    "label": "Read",
+                    "emoji": {"name": "✅"},
+                    "custom_id": "news_article_read",
+                },
+                {
+                    "type": 2,
+                    "style": 1,
+                    "label": "More",
+                    "emoji": {"name": "⭐"},
+                    "custom_id": "news_article_keep",
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Less",
+                    "emoji": {"name": "👎"},
+                    "custom_id": "news_article_skip",
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Deep Dive",
+                    "emoji": {"name": "🧵"},
+                    "custom_id": "news_article_deep",
+                },
+            ],
+        }
+    ]
+
+
+def _split_discord_news_article_messages(content: str) -> Optional[list[tuple[str, bool]]]:
+    starts = list(re.finditer(r"(?m)^\s*(\d+)\.\s+\*\*", content or ""))
+    if len(starts) < 2:
+        return None
+
+    skip_match = re.search(r"(?m)^###\s+SKIP\b", content or "")
+    article_end_limit = skip_match.start() if skip_match else len(content)
+    starts = [m for m in starts if m.start() < article_end_limit]
+    if len(starts) < 2:
+        return None
+
+    segments: list[tuple[str, bool]] = []
+    preamble = content[: starts[0].start()].strip()
+    if preamble:
+        segments.append((preamble, False))
+
+    for idx, match in enumerate(starts):
+        next_start = starts[idx + 1].start() if idx + 1 < len(starts) else article_end_limit
+        article = content[match.start():next_start].strip()
+        if article:
+            segments.append((article, True))
+
+    tail = content[article_end_limit:].strip()
+    if tail:
+        segments.append((tail, False))
+
+    return segments or None
 
 
 async def _discord_retry_after(resp, attempt: int) -> float | None:
@@ -552,6 +650,38 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.DISCORD:
         from gateway.markdown_table_images import segment_markdown_tables
 
+        news_segments = None
+        if (
+            not thread_id
+            and not media_files
+            and _discord_news_article_buttons_enabled(pconfig)
+            and str(chat_id) in _discord_news_article_button_channel_ids(pconfig)
+        ):
+            news_segments = _split_discord_news_article_messages(message)
+
+        if news_segments:
+            last_result = None
+            article_components = _discord_news_article_components()
+            for segment, attach_article_buttons in news_segments:
+                segment_chunks = BasePlatformAdapter.truncate_message(segment, DiscordAdapter.MAX_MESSAGE_LENGTH)
+                for idx, chunk in enumerate(segment_chunks):
+                    if not chunk.strip():
+                        continue
+                    result = await _send_discord(
+                        pconfig.token,
+                        chat_id,
+                        chunk,
+                        media_files=[],
+                        thread_id=thread_id,
+                        components=article_components
+                        if attach_article_buttons and idx == len(segment_chunks) - 1
+                        else None,
+                    )
+                    if isinstance(result, dict) and result.get("error"):
+                        return result
+                    last_result = result
+            return last_result
+
         table_segments = segment_markdown_tables(message)
         table_segments_changed = (
             len(table_segments) != 1
@@ -894,7 +1024,7 @@ def _probe_is_forum_cached(chat_id: str) -> Optional[bool]:
     return _DISCORD_CHANNEL_TYPE_PROBE_CACHE.get(str(chat_id))
 
 
-async def _send_discord(token, chat_id, message, thread_id=None, media_files=None):
+async def _send_discord(token, chat_id, message, thread_id=None, media_files=None, components=None):
     """Send a single message via Discord REST API (no websocket client needed).
 
     Chunking is handled by _send_to_platform() before this is called.
@@ -1019,7 +1149,14 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
                             headers=json_headers,
                             json={
                                 "name": thread_name,
-                                "message": {"content": message},
+                                "message": {
+                                    key: value
+                                    for key, value in {
+                                        "content": message,
+                                        "components": components,
+                                    }.items()
+                                    if value is not None
+                                },
                             },
                             **_req_kw,
                         ) as resp:
@@ -1047,7 +1184,10 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
                 for attempt in range(4):
-                    async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                    payload = {"content": message}
+                    if components:
+                        payload["components"] = components
+                    async with session.post(url, headers=json_headers, json=payload, **_req_kw) as resp:
                         delay = await _discord_retry_after(resp, attempt)
                         if delay is not None and attempt < 3:
                             await asyncio.sleep(delay)
