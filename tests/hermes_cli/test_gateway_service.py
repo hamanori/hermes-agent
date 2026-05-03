@@ -441,9 +441,15 @@ class TestLaunchdServiceRecovery:
         calls = []
         target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
 
+        monkeypatch.setattr(gateway_cli, "_claim_launchd_restart_cooldown", lambda: True)
         monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+        monkeypatch.setattr(gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: False)
         monkeypatch.setattr(gateway_cli, "_request_gateway_self_restart", lambda pid: False)
-        monkeypatch.setattr(gateway_cli, "_wait_for_gateway_exit", lambda timeout, force_after=None: True)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_gateway_exit",
+            lambda timeout, force_after=None, target_pid=None: True,
+        )
         monkeypatch.setattr(gateway_cli, "terminate_pid", lambda pid, force=False: calls.append(("term", pid, force)))
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
@@ -466,6 +472,8 @@ class TestLaunchdServiceRecovery:
     def test_launchd_restart_self_requests_graceful_restart_without_kickstart(self, monkeypatch, capsys):
         calls = []
 
+        monkeypatch.setattr(gateway_cli, "_claim_launchd_restart_cooldown", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_is_pid_ancestor_of_current_process", lambda pid: False)
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda: 321,
@@ -485,6 +493,27 @@ class TestLaunchdServiceRecovery:
 
         assert calls == [("self", 321)]
         assert "restart requested" in capsys.readouterr().out.lower()
+
+    def test_launchd_restart_cooldown_rejects_recent_restart(self, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+
+        assert gateway_cli._claim_launchd_restart_cooldown(now=1000.0) is True
+        assert gateway_cli._claim_launchd_restart_cooldown(now=1010.0) is False
+        assert "cooldown" in capsys.readouterr().out.lower()
+
+    def test_launchd_restart_cooldown_allows_after_window(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+
+        assert gateway_cli._claim_launchd_restart_cooldown(now=1000.0) is True
+        assert gateway_cli._claim_launchd_restart_cooldown(now=1061.0) is True
+
+    def test_launchd_restart_cooldown_slides_on_repeated_rejections(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: tmp_path)
+
+        assert gateway_cli._claim_launchd_restart_cooldown(now=1000.0) is True
+        assert gateway_cli._claim_launchd_restart_cooldown(now=1010.0) is False
+        assert gateway_cli._claim_launchd_restart_cooldown(now=1061.0) is False
+        assert gateway_cli._claim_launchd_restart_cooldown(now=1122.0) is True
 
     def test_launchd_stop_uses_bootout_not_kill(self, monkeypatch):
         """launchd_stop must bootout the service so KeepAlive doesn't respawn it."""

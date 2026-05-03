@@ -5,16 +5,19 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
 import textwrap
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+_LAUNCHD_RESTART_COOLDOWN_SECONDS = 60.0
 
 from gateway.status import terminate_pid
 from gateway.restart import (
@@ -2715,7 +2718,56 @@ def _wait_for_gateway_exit(
     return True
 
 
+def _launchd_restart_cooldown_path() -> Path:
+    return get_hermes_home() / ".gateway_restart_cooldown.json"
+
+
+def _claim_launchd_restart_cooldown(now: float | None = None) -> bool:
+    """Return False when another launchd restart was requested very recently.
+
+    Automated agent/tool loops can issue ``hermes gateway restart`` repeatedly
+    while the service is still coming back up.  A short per-profile cooldown
+    keeps one valid restart working while preventing a restart storm from
+    continually SIGTERMing the freshly spawned gateway.
+    """
+    if os.getenv("HERMES_DISABLE_GATEWAY_RESTART_COOLDOWN", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return True
+
+    now = time.time() if now is None else now
+    path = _launchd_restart_cooldown_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        last_requested_at = float(payload.get("last_requested_at", 0))
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        last_requested_at = 0
+
+    elapsed = now - last_requested_at
+    if 0 <= elapsed < _LAUNCHD_RESTART_COOLDOWN_SECONDS:
+        remaining = _LAUNCHD_RESTART_COOLDOWN_SECONDS - elapsed
+        try:
+            path.write_text(json.dumps({"last_requested_at": now}) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        print(f"⚠ Gateway restart skipped: restart requested {elapsed:.0f}s ago (cooldown {remaining:.0f}s left)")
+        return False
+
+    try:
+        path.write_text(json.dumps({"last_requested_at": now}) + "\n", encoding="utf-8")
+    except OSError:
+        # If the marker cannot be written, prefer preserving the operator's
+        # explicit restart request over failing the command.
+        pass
+    return True
+
+
 def launchd_restart():
+    if not _claim_launchd_restart_cooldown():
+        return
+
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
