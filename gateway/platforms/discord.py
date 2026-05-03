@@ -11,6 +11,7 @@ Uses discord.py library for:
 
 import asyncio
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -600,6 +601,8 @@ class DiscordAdapter(BasePlatformAdapter):
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
         self._thread_lifecycle_persistent_view_registered: bool = False
         self._news_article_persistent_view_registered: bool = False
+        self._todoist_classifier = None
+        self._todoist_client_cls = None
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -3105,137 +3108,383 @@ class DiscordAdapter(BasePlatformAdapter):
             return ""
         return "#" + issue.lstrip("#")
 
-    def _build_todo_prompt(
-        self,
-        action: str,
-        *,
-        issue: str | None = None,
-        text: str | None = None,
-        target: str | None = None,
-    ) -> str:
-        action = (action or "today").strip().lower()
-        issue_ref = self._normalize_todo_issue(issue)
-        text = (text or "").strip()
-        target = (target or "").strip().lower()
-        if action == "today":
-            return "今日のTODOを見せて。Discord向けに短く、各項目にIssue番号を含めて。"
-        if action == "week":
-            return "今週のTODOを見せて。Next/Doing/Laterの棚ごとに短く整理して。"
-        if action == "shopping":
-            return "買い物リストを見せて。買った/あとで/詳細の操作がしやすい形で。"
-        if action == "later":
-            return "LaterのTODOを見せて。Nextへ上げる候補も短く提案して。"
-        if action == "create":
-            return f"TODO候補として確認カード前提で整理して: {text}"
-        if action == "view" and issue_ref:
-            return f"{issue_ref} のTODO詳細をDiscordカード向けに見せて。"
-        if action == "done" and issue_ref:
-            return f"Issue {issue_ref} のTODOを完了にして。"
-        if action == "move" and issue_ref:
-            target_label = {
-                "tomorrow": "明日へ",
-                "next-week": "来週へ",
-                "someday": "いつかへ",
-                "later": "Laterへ",
-                "doing": "Doingへ",
-            }.get(target, target or "指定先へ")
-            return f"Issue {issue_ref} のTODOを{target_label}送って。"
-        return "今日のTODOを見せて。Discord向けに短く、各項目にIssue番号を含めて。"
-
     async def _send_todo_control_card(self, channel: Any) -> None:
-        view = None
-        try:
-            view = self._build_todo_control_view(None)
-        except Exception as e:
-            logger.debug("Discord TODO control view build failed: %s", e)
         await channel.send(
-            "TODO操作カードです。よく使う操作はここから押せます。",
-            view=view,
+            "TODOを追加したい内容を `/todo text:牛乳を買う` の形で送ってな。"
+            "カテゴリ・セクション・期限は内容から推測して、追加前に確認を出します。"
         )
 
     def _todo_text_trigger_action(self, text: str) -> str | None:
         normalized = (text or "").strip().lower().replace("　", " ")
         normalized = " ".join(normalized.split())
-        if normalized in {"todo", "todo today", "todo一覧", "todo 一覧", "今日のtodo", "今日の todo"}:
-            return "today"
-        if normalized in {"todoカード", "todo card", "todo操作", "todo 操作", "todoボタン", "todo ボタン"}:
-            return "card"
+        if normalized in {
+            "todo",
+            "todo today",
+            "todo一覧",
+            "todo 一覧",
+            "今日のtodo",
+            "今日の todo",
+            "todoカード",
+            "todo card",
+            "todo操作",
+            "todo 操作",
+            "todoボタン",
+            "todo ボタン",
+        }:
+            return "hint"
         return None
 
-    async def _dispatch_todo_text(self, interaction: discord.Interaction, prompt: str) -> None:
-        event = self._build_slash_event(interaction, prompt)
-        await self.handle_message(event)
+    def _todoist_repo_path(self) -> _Path:
+        configured = (
+            os.getenv("TODOIST_LIFE_REPO")
+            or self.config.extra.get("todoist_life_repo")
+            or "~/Development/Life"
+        )
+        return _Path(str(configured)).expanduser()
 
-    def _build_todo_control_view(self, interaction: discord.Interaction):
+    def _load_life_script_module(self, module_name: str, file_name: str):
+        repo = self._todoist_repo_path()
+        path = repo / "scripts" / file_name
+        if not path.exists():
+            raise RuntimeError(f"Life repo Todoist helper not found: {path}")
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"Unable to load Todoist helper: {path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    def _get_todoist_classifier(self):
+        if self._todoist_classifier is None:
+            module = self._load_life_script_module("life_todoist_classifier", "todoist_classifier.py")
+            self._todoist_classifier = module.classify
+        return self._todoist_classifier
+
+    def _get_todoist_client_cls(self):
+        if self._todoist_client_cls is None:
+            module = self._load_life_script_module("life_todoist_client", "todoist_client.py")
+            self._todoist_client_cls = module.TodoistClient
+        return self._todoist_client_cls
+
+    def _todoist_project_label(self, key: str) -> str:
+        return {
+            "shopping": "🛒 shopping",
+            "home": "🏠 home",
+            "admin": "📄 admin",
+            "general": "📦 general",
+        }.get(key or "general", "📦 general")
+
+    def _normalize_todoist_project_key(self, value: str | None) -> str | None:
+        raw = (value or "").strip()
+        if not raw:
+            return None
+        normalized = " ".join(raw.lower().replace("　", " ").split())
+        aliases = {
+            "shopping": {"shopping", "🛒 shopping", "🛒", "買い物", "買物"},
+            "home": {"home", "🏠 home", "🏠", "家", "家事"},
+            "admin": {"admin", "📄 admin", "📄", "事務", "役所", "手続き"},
+            "general": {"general", "📦 general", "📦", "その他", "misc"},
+        }
+        for key, values in aliases.items():
+            if normalized in values:
+                return key
+        return None
+
+    def _classify_todoist_text(self, text: str) -> list[dict[str, str]]:
+        classifier = self._get_todoist_classifier()
+        classified = classifier(text)
+        items: list[dict[str, str]] = []
+        for item in classified:
+            project_key = str(getattr(item, "project_key", "general") or "general")
+            items.append({
+                "title": str(getattr(item, "title", "") or "").strip(),
+                "project_key": project_key,
+                "project": self._todoist_project_label(project_key),
+                "section": str(getattr(item, "section", "") or "").strip(),
+                "due": str(getattr(item, "due", "") or "").strip(),
+                "note": str(getattr(item, "note", "") or "").strip(),
+            })
+        return [item for item in items if item["title"]]
+
+    def _build_todoist_items(
+        self,
+        text: str,
+        *,
+        project_key: str = "",
+        section: str = "",
+        due: str = "",
+        note: str = "",
+    ) -> list[dict[str, str]]:
+        items = self._classify_todoist_text(text)
+        if not items:
+            return []
+
+        override_project_key = self._normalize_todoist_project_key(project_key)
+        override_section = (section or "").strip()
+        override_due = (due or "").strip()
+        override_note = (note or "").strip()
+
+        for item in items:
+            if override_project_key:
+                item["project_key"] = override_project_key
+                item["project"] = self._todoist_project_label(override_project_key)
+            if override_section:
+                item["section"] = override_section
+            if override_due:
+                item["due"] = override_due
+            if override_note:
+                item["note"] = override_note
+        return items
+
+    def _build_todoist_preview_message(self, items: list[dict[str, str]]) -> str:
+        lines = [
+            "Todoistに追加する前の確認です。",
+            "推測が違う場合は下のドロップダウンで直せます。",
+            "内容がよければ Add、やめるなら Cancel を押してください。",
+            "",
+        ]
+        for idx, item in enumerate(items, start=1):
+            title = item.get("title", "").strip()
+            project = item.get("project", "📦 general").strip()
+            section = item.get("section", "").strip() or "なし"
+            due = item.get("due", "").strip() or "なし"
+            note = item.get("note", "").strip()
+            lines.extend([
+                f"{idx}. {title}",
+                f"   Project: {project}",
+                f"   Section: {section}",
+                f"   Due: {due}",
+            ])
+            if note:
+                lines.append(f"   Note: {note}")
+        lines.extend(["", "Actions: Add / Cancel"])
+        return "\n".join(lines)
+
+    def _todoist_select_default(self, value: str, options: list[dict[str, str]]) -> str:
+        values = {option["value"] for option in options}
+        return value if value in values else options[0]["value"]
+
+    def _todoist_project_options(self, selected: str) -> list[Any]:
+        options = [
+            {"label": "shopping — 買い物", "value": "shopping", "description": "買い物、食材、日用品"},
+            {"label": "home — 家", "value": "home", "description": "家事、片付け、暮らし"},
+            {"label": "admin — 事務", "value": "admin", "description": "役所、銀行、手続き"},
+            {"label": "general — その他", "value": "general", "description": "分類しにくいTODO"},
+        ]
+        selected = self._todoist_select_default(self._normalize_todoist_project_key(selected) or "general", options)
+        return [
+            discord.SelectOption(
+                label=option["label"],
+                value=option["value"],
+                description=option["description"],
+                default=option["value"] == selected,
+            )
+            for option in options
+        ]
+
+    def _todoist_section_options(self, selected: str) -> list[Any]:
+        options = [
+            {"label": "なし", "value": "__none__", "description": "セクション未指定"},
+            {"label": "food — shopping", "value": "food", "description": "食材、飲料、調理まわり"},
+            {"label": "daily — home", "value": "daily", "description": "日常の家事"},
+            {"label": "cleaning — home", "value": "cleaning", "description": "掃除"},
+            {"label": "organizing — home", "value": "organizing", "description": "整理、片付け"},
+            {"label": "government — admin", "value": "government", "description": "役所、行政手続き"},
+            {"label": "bank — admin", "value": "bank", "description": "銀行、お金の手続き"},
+        ]
+        selected_value = (selected or "").strip() or "__none__"
+        selected_value = self._todoist_select_default(selected_value, options)
+        return [
+            discord.SelectOption(
+                label=option["label"],
+                value=option["value"],
+                description=option["description"],
+                default=option["value"] == selected_value,
+            )
+            for option in options
+        ]
+
+    def _todoist_due_options(self, selected: str) -> list[Any]:
+        options = [
+            {"label": "なし", "value": "__none__", "description": "期限なし"},
+            {"label": "今日", "value": "今日", "description": "今日中"},
+            {"label": "明日", "value": "明日", "description": "明日"},
+            {"label": "今週末", "value": "今週末", "description": "直近の週末"},
+            {"label": "来週", "value": "来週", "description": "来週中"},
+            {"label": "月末", "value": "月末", "description": "今月末"},
+        ]
+        selected_value = (selected or "").strip() or "__none__"
+        selected_value = self._todoist_select_default(selected_value, options)
+        return [
+            discord.SelectOption(
+                label=option["label"],
+                value=option["value"],
+                description=option["description"],
+                default=option["value"] == selected_value,
+            )
+            for option in options
+        ]
+
+    async def _create_todoist_tasks(self, items: list[dict[str, str]]) -> list[str]:
+        def _create() -> list[str]:
+            client_cls = self._get_todoist_client_cls()
+            client = client_cls.from_env()
+            created: list[str] = []
+            for item in items:
+                project_key = self._normalize_todoist_project_key(item.get("project_key")) or "general"
+                section = item.get("section") or None
+                project_name = self._todoist_project_label(project_key)
+                project, section_obj = client.resolve_project_and_section(project_name, section)
+                task = client.add_task(
+                    content=item["title"],
+                    project_id=project.get("id") if project else None,
+                    section_id=section_obj.get("id") if section_obj else None,
+                    due_string=item.get("due") or None,
+                    description=item.get("note") or None,
+                )
+                created.append(str(task.get("url") or task.get("id") or item["title"]))
+            return created
+
+        return await asyncio.to_thread(_create)
+
+    def _build_todoist_preview_view(self, items: list[dict[str, str]], original_text: str):
         adapter = self
 
-        class TodoControlView(discord.ui.View):
+        class TodoistPreviewView(discord.ui.View):
             def __init__(self):
                 super().__init__(timeout=900)
+                self._refresh_controls()
 
-            async def _run(self, button_interaction: discord.Interaction, action: str, **kwargs) -> None:
-                await button_interaction.response.defer(ephemeral=True)
-                prompt = adapter._build_todo_prompt(action, **kwargs)
-                await adapter._dispatch_todo_text(button_interaction, prompt)
-                await button_interaction.edit_original_response(content="TODO操作を開始しました。")
+            def _first_item_value(self, key: str) -> str:
+                return str(items[0].get(key, "") or "") if items else ""
 
-            @discord.ui.button(label="今日", style=discord.ButtonStyle.primary)
-            async def today(self, button_interaction: discord.Interaction, _button):
-                await self._run(button_interaction, "today")
+            def _apply_to_items(self, key: str, value: str) -> None:
+                for item in items:
+                    item[key] = value
+                    if key == "project_key":
+                        item["project"] = adapter._todoist_project_label(value)
 
-            @discord.ui.button(label="買い物", style=discord.ButtonStyle.secondary)
-            async def shopping(self, button_interaction: discord.Interaction, _button):
-                await self._run(button_interaction, "shopping")
+            async def _update_preview(self, interaction: discord.Interaction) -> None:
+                self._refresh_controls()
+                await interaction.response.edit_message(
+                    content=adapter._build_todoist_preview_message(items),
+                    view=self,
+                )
 
-            @discord.ui.button(label="Later", style=discord.ButtonStyle.secondary)
-            async def later(self, button_interaction: discord.Interaction, _button):
-                await self._run(button_interaction, "later")
+            def _refresh_controls(self) -> None:
+                self.clear_items()
 
-            @discord.ui.button(label="新規TODO", style=discord.ButtonStyle.success)
-            async def create(self, button_interaction: discord.Interaction, _button):
-                await button_interaction.response.send_modal(adapter._build_todo_create_modal(button_interaction))
+                project_select = discord.ui.Select(
+                    placeholder="カテゴリ",
+                    min_values=1,
+                    max_values=1,
+                    options=adapter._todoist_project_options(self._first_item_value("project_key")),
+                    row=0,
+                )
+                project_select.callback = self._on_project_selected
+                self.add_item(project_select)
 
-        return TodoControlView()
+                section_select = discord.ui.Select(
+                    placeholder="セクション",
+                    min_values=1,
+                    max_values=1,
+                    options=adapter._todoist_section_options(self._first_item_value("section")),
+                    row=1,
+                )
+                section_select.callback = self._on_section_selected
+                self.add_item(section_select)
 
-    def _build_todo_create_modal(self, interaction: discord.Interaction):
-        adapter = self
+                due_select = discord.ui.Select(
+                    placeholder="期限",
+                    min_values=1,
+                    max_values=1,
+                    options=adapter._todoist_due_options(self._first_item_value("due")),
+                    row=2,
+                )
+                due_select.callback = self._on_due_selected
+                self.add_item(due_select)
 
-        class TodoCreateModal(discord.ui.Modal, title="TODO作成"):
-            task = discord.ui.TextInput(label="タスク", placeholder="例: 水曜までにMoshi設定見る", required=True, max_length=400)
-            due = discord.ui.TextInput(label="期限", placeholder="例: 明日 / 来週 / 未設定", required=False, max_length=120)
+                add_button = discord.ui.Button(label="Add", style=discord.ButtonStyle.success, row=3)
+                add_button.callback = self._on_add_clicked
+                self.add_item(add_button)
 
-            async def on_submit(self, modal_interaction: discord.Interaction) -> None:
-                await modal_interaction.response.defer(ephemeral=True)
-                task_value = str(self.task.value).strip()
-                due_value = str(self.due.value).strip()
-                text_value = f"{task_value} 期限:{due_value}" if due_value else task_value
-                prompt = adapter._build_todo_prompt("create", text=text_value)
-                await adapter._dispatch_todo_text(modal_interaction, prompt)
-                await modal_interaction.edit_original_response(content="TODO作成を開始しました。")
+                cancel_button = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.danger, row=3)
+                cancel_button.callback = self._on_cancel_clicked
+                self.add_item(cancel_button)
 
-        return TodoCreateModal()
+            async def _on_project_selected(self, interaction: discord.Interaction):
+                value = str(interaction.data.get("values", ["general"])[0])
+                project_key = adapter._normalize_todoist_project_key(value) or "general"
+                self._apply_to_items("project_key", project_key)
+                await self._update_preview(interaction)
+
+            async def _on_section_selected(self, interaction: discord.Interaction):
+                value = str(interaction.data.get("values", ["__none__"])[0])
+                self._apply_to_items("section", "" if value == "__none__" else value)
+                await self._update_preview(interaction)
+
+            async def _on_due_selected(self, interaction: discord.Interaction):
+                value = str(interaction.data.get("values", ["__none__"])[0])
+                self._apply_to_items("due", "" if value == "__none__" else value)
+                await self._update_preview(interaction)
+
+            async def _on_add_clicked(self, button_interaction: discord.Interaction):
+                await button_interaction.response.defer(ephemeral=True, thinking=True)
+                try:
+                    created = await adapter._create_todoist_tasks(items)
+                except Exception as e:
+                    logger.warning("Todoist add failed: %s", e, exc_info=True)
+                    await button_interaction.edit_original_response(
+                        content=f"Todoistへの追加に失敗しました。入力は残しておくね: {original_text}"
+                    )
+                    return
+                suffix = "\n" + "\n".join(f"- {entry}" for entry in created) if created else ""
+                try:
+                    await button_interaction.message.edit(content=f"Todoistに追加しました。{suffix}", view=None)
+                except Exception as e:
+                    logger.warning("Todoist preview message update failed: %s", e, exc_info=True)
+                await button_interaction.edit_original_response(content=f"Todoistに追加しました。{suffix}", view=None)
+
+            async def _on_cancel_clicked(self, button_interaction: discord.Interaction):
+                await button_interaction.response.edit_message(content="追加をキャンセルしました。", view=None)
+                try:
+                    await button_interaction.message.edit(content="追加をキャンセルしました。", view=None)
+                except Exception as e:
+                    logger.debug("Todoist preview message cleanup after cancel failed: %s", e)
+
+        return TodoistPreviewView()
 
     async def _run_todo_slash(
         self,
         interaction: discord.Interaction,
         *,
-        action: str = "today",
-        issue: str = "",
         text: str = "",
-        target: str = "",
     ) -> None:
-        await interaction.response.defer(ephemeral=True)
-        prompt = self._build_todo_prompt(action, issue=issue, text=text, target=target)
+        text = (text or "").strip()
+        if not text:
+            await interaction.response.send_message(
+                "TODOを追加するには `/todo text:牛乳を買う` の形で送ってください。"
+                "カテゴリ・セクション・期限は内容から推測して、追加前に確認を出します。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            if getattr(interaction, "channel", None) is not None:
-                await interaction.channel.send(
-                    "TODO操作カードです。よく使う操作はここから押せます。",
-                    view=self._build_todo_control_view(interaction),
-                )
+            items = self._build_todoist_items(text)
+            if not items:
+                raise RuntimeError("no Todoist task candidates")
+            await interaction.channel.send(
+                self._build_todoist_preview_message(items),
+                view=self._build_todoist_preview_view(items, text),
+            )
+            await interaction.edit_original_response(content="Todoist追加前の確認を表示しました。")
         except Exception as e:
-            logger.debug("Discord TODO control card send failed: %s", e)
-        await self._dispatch_todo_text(interaction, prompt)
-        await interaction.edit_original_response(content="TODO操作を開始しました。")
+            logger.warning("Discord Todoist preview failed: %s", e, exc_info=True)
+            await interaction.edit_original_response(
+                content="Todoistに追加できる形に分類できませんでした。入力は保存してないので、もう少し具体的に書いてみてな。"
+            )
 
     async def _run_simple_slash(
         self,
@@ -3436,45 +3685,17 @@ class DiscordAdapter(BasePlatformAdapter):
         async def slash_background(interaction: discord.Interaction, prompt: str):
             await self._run_simple_slash(interaction, f"/background {prompt}", "Background task started~")
 
-        @tree.command(name="todo", description="Life TODO dashboard and quick actions")
+        @tree.command(name="todo", description="Add a Todoist task with confirmation")
         @discord.app_commands.describe(
-            action="TODO action",
-            issue="Issue number for view/done/move (e.g. 250 or #250)",
-            text="Task text for create",
-            target="Move target: tomorrow, next-week, someday, later, doing",
-        )
-        @discord.app_commands.choices(
-            action=[
-                discord.app_commands.Choice(name="today — 今日のTODO", value="today"),
-                discord.app_commands.Choice(name="week — 今週", value="week"),
-                discord.app_commands.Choice(name="shopping — 買い物", value="shopping"),
-                discord.app_commands.Choice(name="later — Later", value="later"),
-                discord.app_commands.Choice(name="view — 詳細", value="view"),
-                discord.app_commands.Choice(name="done — 完了", value="done"),
-                discord.app_commands.Choice(name="move — 移動", value="move"),
-                discord.app_commands.Choice(name="create — 作成", value="create"),
-            ],
-            target=[
-                discord.app_commands.Choice(name="tomorrow — 明日へ", value="tomorrow"),
-                discord.app_commands.Choice(name="next-week — 来週へ", value="next-week"),
-                discord.app_commands.Choice(name="someday — いつかへ", value="someday"),
-                discord.app_commands.Choice(name="later — Laterへ", value="later"),
-                discord.app_commands.Choice(name="doing — Doingへ", value="doing"),
-            ],
+            text="Task text to add. Category, section, and due date are inferred before confirmation.",
         )
         async def slash_todo(
             interaction: discord.Interaction,
-            action: str = "today",
-            issue: str = "",
             text: str = "",
-            target: str = "",
         ):
             await self._run_todo_slash(
                 interaction,
-                action=action,
-                issue=issue,
                 text=text,
-                target=target,
             )
 
         # ── Auto-register any gateway-available commands not yet on the tree ──
@@ -4853,11 +5074,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 await self._send_todo_control_card(effective_channel)
             except Exception as e:
                 logger.debug("Discord TODO text-trigger card send failed: %s", e)
-            if todo_trigger_action == "card":
-                return
-            event.text = self._build_todo_prompt(todo_trigger_action)
-            event.message_type = MessageType.COMMAND
-            msg_type = MessageType.COMMAND
+            return
 
         # Only batch plain text messages — commands, media, etc. dispatch
         # immediately since they won't be split by the Discord client.
