@@ -3698,6 +3698,46 @@ class DiscordAdapter(BasePlatformAdapter):
                 text=text,
             )
 
+        @tree.command(name="chatgpt-pro", description="Run ChatGPT Pro extended thinking")
+        @discord.app_commands.describe(
+            prompt="What to ask ChatGPT Pro. Leave empty to get a prompt reminder.",
+        )
+        async def slash_chatgpt_pro(
+            interaction: discord.Interaction,
+            prompt: str = "",
+        ):
+            prompt = (prompt or "").strip()
+            if not prompt:
+                await interaction.response.send_message(
+                    "何を Pro extended thinking で考えさせる？",
+                    ephemeral=True,
+                )
+                return
+            await self._run_simple_slash(
+                interaction,
+                f"/chatgpt-pro {prompt}",
+            )
+
+        @tree.command(name="chatgpt-research", description="Run ChatGPT Deep Research")
+        @discord.app_commands.describe(
+            prompt="What to research. Include scope, output shape, and constraints if useful.",
+        )
+        async def slash_chatgpt_research(
+            interaction: discord.Interaction,
+            prompt: str = "",
+        ):
+            prompt = (prompt or "").strip()
+            if not prompt:
+                await interaction.response.send_message(
+                    "何を Deep Research で調べる？範囲や出力形式もあれば教えて",
+                    ephemeral=True,
+                )
+                return
+            await self._run_simple_slash(
+                interaction,
+                f"/chatgpt-research {prompt}",
+            )
+
         # ── Auto-register any gateway-available commands not yet on the tree ──
         # This ensures new commands added to COMMAND_REGISTRY in
         # hermes_cli/commands.py automatically appear as Discord slash
