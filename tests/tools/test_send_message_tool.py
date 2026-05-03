@@ -23,6 +23,7 @@ def _reset_signal_scheduler():
 from gateway.config import Platform
 from tools.send_message_tool import (
     _derive_forum_thread_name,
+    _discord_retry_after,
     _parse_target_ref,
     _send_discord,
     _send_matrix_via_adapter,
@@ -43,6 +44,18 @@ def _make_config():
         platforms={Platform.TELEGRAM: telegram_cfg},
         get_home_channel=lambda _platform: None,
     ), telegram_cfg
+
+
+@pytest.mark.asyncio
+async def test_discord_retry_after_uses_json_retry_delay():
+    class FakeResponse:
+        status = 429
+        headers = {}
+
+        async def json(self, content_type=None):
+            return {"retry_after": 0.5}
+
+    assert await _discord_retry_after(FakeResponse(), 2) == pytest.approx(0.7)
 
 
 def _install_telegram_mock(monkeypatch, bot):

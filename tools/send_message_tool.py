@@ -69,6 +69,22 @@ def _error(message: str) -> dict:
     return {"error": _sanitize_error_text(message)}
 
 
+async def _discord_retry_after(resp, attempt: int) -> float | None:
+    if resp.status != 429:
+        return None
+    retry_after = None
+    try:
+        data = await resp.json(content_type=None)
+        retry_after = data.get("retry_after")
+    except Exception:
+        retry_after = resp.headers.get("Retry-After")
+    try:
+        delay = float(retry_after)
+    except (TypeError, ValueError):
+        delay = 1.0
+    return max(delay, 0.25) + (0.1 * attempt)
+
+
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     retry_after = getattr(exc, "retry_after", None)
     if retry_after is not None:
@@ -1004,11 +1020,17 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
-                    if resp.status not in (200, 201):
-                        body = await resp.text()
-                        return _error(f"Discord API error ({resp.status}): {body}")
-                    last_data = await resp.json()
+                for attempt in range(4):
+                    async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                        delay = await _discord_retry_after(resp, attempt)
+                        if delay is not None and attempt < 3:
+                            await asyncio.sleep(delay)
+                            continue
+                        if resp.status not in (200, 201):
+                            body = await resp.text()
+                            return _error(f"Discord API error ({resp.status}): {body}")
+                        last_data = await resp.json()
+                        break
 
             # Send each media file as a separate multipart upload
             for media_path, _is_voice in media_files:
@@ -1018,18 +1040,24 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
                     warnings.append(warning)
                     continue
                 try:
-                    form = aiohttp.FormData()
                     filename = os.path.basename(media_path)
-                    with open(media_path, "rb") as f:
-                        form.add_field("files[0]", f, filename=filename)
+                    for attempt in range(4):
+                        form = aiohttp.FormData()
+                        with open(media_path, "rb") as f:
+                            form.add_field("files[0]", f.read(), filename=filename)
                         async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
+                            delay = await _discord_retry_after(resp, attempt)
+                            if delay is not None and attempt < 3:
+                                await asyncio.sleep(delay)
+                                continue
                             if resp.status not in (200, 201):
                                 body = await resp.text()
                                 warning = _sanitize_error_text(f"Failed to send media {media_path}: Discord API error ({resp.status}): {body}")
                                 logger.error(warning)
                                 warnings.append(warning)
-                                continue
+                                break
                             last_data = await resp.json()
+                            break
                 except Exception as e:
                     warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
                     logger.error(warning)
