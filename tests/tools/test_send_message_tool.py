@@ -2015,7 +2015,7 @@ async def test_send_to_platform_sends_discord_table_image_in_order(monkeypatch, 
         calls.append({"message": message, "media_files": media_files or [], "thread_id": thread_id})
         return {"success": True, "message_id": str(len(calls))}
 
-    monkeypatch.setattr("gateway.markdown_table_images.render_table_png", lambda table, output_dir=None: str(tmp_path / "table.png"))
+    monkeypatch.setattr("gateway.markdown_table_images.render_table_pngs", lambda table, output_dir=None: [str(tmp_path / "table.png")])
     monkeypatch.setattr("tools.send_message_tool._send_discord", fake_send_discord)
 
     message = "Before\n\n| A | B |\n|---|---|\n| x | y |\n\nAfter"
@@ -2042,7 +2042,7 @@ async def test_send_to_platform_uses_fenced_fallback_when_discord_table_render_f
     def fail_render(table, output_dir=None):
         raise RuntimeError("no renderer")
 
-    monkeypatch.setattr("gateway.markdown_table_images.render_table_png", fail_render)
+    monkeypatch.setattr("gateway.markdown_table_images.render_table_pngs", fail_render)
     monkeypatch.setattr("tools.send_message_tool._send_discord", fake_send_discord)
 
     cfg = SimpleNamespace(token="***", extra={})

@@ -393,7 +393,7 @@ async def test_send_renders_markdown_table_as_image_segment(monkeypatch, tmp_pat
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     image_path = tmp_path / "table.png"
     image_path.write_bytes(b"png")
-    monkeypatch.setattr("gateway.markdown_table_images.render_table_png", lambda table, output_dir=None: str(image_path))
+    monkeypatch.setattr("gateway.markdown_table_images.render_table_pngs", lambda table, output_dir=None: [str(image_path)])
 
     sent_msg = SimpleNamespace(id=1234)
     send_calls = []
