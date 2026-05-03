@@ -9,7 +9,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
+exclude-newer = "2026-04-26T07:29:51.262877Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -1968,6 +1968,7 @@ dependencies = [
     { name = "jinja2" },
     { name = "openai" },
     { name = "parallel-web" },
+    { name = "pillow" },
     { name = "prompt-toolkit" },
     { name = "pydantic" },
     { name = "pyjwt", extra = ["crypto"] },
@@ -2204,6 +2205,7 @@ requires-dist = [
     { name = "numpy", marker = "extra == 'voice'", specifier = ">=1.24.0,<3" },
     { name = "openai", specifier = ">=2.21.0,<3" },
     { name = "parallel-web", specifier = ">=0.4.2,<1" },
+    { name = "pillow", specifier = ">=12.0.0,<13" },
     { name = "prompt-toolkit", specifier = ">=3.0.52,<4" },
     { name = "ptyprocess", marker = "sys_platform != 'win32' and extra == 'pty'", specifier = ">=0.7.0,<1" },
     { name = "pydantic", specifier = ">=2.12.5,<3" },
