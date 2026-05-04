@@ -12074,7 +12074,9 @@ class GatewayRunner:
             _progress_thread_id = source.thread_id or event_message_id
         else:
             _progress_thread_id = source.thread_id
-        _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _progress_thread_metadata = {"thread_lifecycle_buttons": False}
+        if _progress_thread_id:
+            _progress_thread_metadata["thread_id"] = _progress_thread_id
 
         async def send_progress_messages():
             if not progress_queue:
@@ -12188,15 +12190,15 @@ class GatewayRunner:
                                     adapter.name,
                                 )
                             can_edit = False
-                            await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_thread_metadata)
                     else:
                         if can_edit:
                             # First tool: send all accumulated text as new message
                             full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
+                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_thread_metadata)
                         else:
                             # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_thread_metadata)
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
 
@@ -12205,7 +12207,7 @@ class GatewayRunner:
                     # Restore typing indicator
                     await asyncio.sleep(0.3)
                     if _run_still_current():
-                        await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                        await adapter.send_typing(source.chat_id, metadata=_progress_thread_metadata)
 
                 except queue.Empty:
                     await asyncio.sleep(0.3)
