@@ -155,6 +155,8 @@ async def test_deep_dive_button_creates_thread_and_dispatches_agent():
     assert calls[6][0] == "dispatch"
     assert calls[6][1] == "456"
     assert "このニュース記事の詳細版スレッドとして深掘りしてください。" in calls[6][3]
+    assert "x-browser / grok-browser" in calls[6][3]
+    assert "X/Grok 由来の情報は一次情報ではなく signal" in calls[6][3]
 
 
 @pytest.mark.skipif(not DISCORD_AVAILABLE, reason="discord.py is not installed")
