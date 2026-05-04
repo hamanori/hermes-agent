@@ -204,11 +204,20 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
             "chat_id": "-1001",
             "content": '💻 terminal: "pwd"',
             "reply_to": None,
-            "metadata": {"thread_id": "17585"},
+            "metadata": {
+                "thread_id": "17585",
+                "thread_lifecycle_buttons": False,
+            },
         }
     ]
     assert adapter.edits
-    assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.typing)
+    assert all(
+        call["metadata"] == {
+            "thread_id": "17585",
+            "thread_lifecycle_buttons": False,
+        }
+        for call in adapter.typing
+    )
 
 
 @pytest.mark.asyncio
@@ -249,8 +258,11 @@ async def test_run_agent_progress_does_not_use_event_message_id_for_telegram_dm(
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    assert adapter.sent[0]["metadata"] is None
-    assert all(call["metadata"] is None for call in adapter.typing)
+    assert adapter.sent[0]["metadata"] == {"thread_lifecycle_buttons": False}
+    assert all(
+        call["metadata"] == {"thread_lifecycle_buttons": False}
+        for call in adapter.typing
+    )
 
 
 @pytest.mark.asyncio
@@ -299,8 +311,17 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
     assert result["final_response"] == "done"
     assert adapter.sent
-    assert adapter.sent[0]["metadata"] == {"thread_id": "1234567890.000001"}
-    assert all(call["metadata"] == {"thread_id": "1234567890.000001"} for call in adapter.typing)
+    assert adapter.sent[0]["metadata"] == {
+        "thread_id": "1234567890.000001",
+        "thread_lifecycle_buttons": False,
+    }
+    assert all(
+        call["metadata"] == {
+            "thread_id": "1234567890.000001",
+            "thread_lifecycle_buttons": False,
+        }
+        for call in adapter.typing
+    )
 
 
 @pytest.mark.asyncio

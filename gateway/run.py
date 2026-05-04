@@ -13370,7 +13370,9 @@ class GatewayRunner:
             _progress_thread_id = source.thread_id or event_message_id
         else:
             _progress_thread_id = source.thread_id
-        _progress_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        _progress_thread_metadata = {"thread_lifecycle_buttons": False}
+        if _progress_thread_id:
+            _progress_thread_metadata["thread_id"] = _progress_thread_id
         _progress_reply_to = (
             event_message_id
             if source.platform == Platform.FEISHU and source.thread_id and event_message_id
@@ -13493,7 +13495,7 @@ class GatewayRunner:
                                 chat_id=source.chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_progress_thread_metadata,
                             )
                             if (
                                 _cleanup_progress
@@ -13509,7 +13511,7 @@ class GatewayRunner:
                                 chat_id=source.chat_id,
                                 content=full_text,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_progress_thread_metadata,
                             )
                         else:
                             # Editing unsupported: send just this line
@@ -13517,7 +13519,7 @@ class GatewayRunner:
                                 chat_id=source.chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
-                                metadata=_progress_metadata,
+                                metadata=_progress_thread_metadata,
                             )
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
@@ -13529,7 +13531,7 @@ class GatewayRunner:
                     # Restore typing indicator
                     await asyncio.sleep(0.3)
                     if _run_still_current():
-                        await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                        await adapter.send_typing(source.chat_id, metadata=_progress_thread_metadata)
 
                 except queue.Empty:
                     await asyncio.sleep(0.3)
