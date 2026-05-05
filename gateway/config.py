@@ -861,7 +861,11 @@ def load_gateway_config() -> GatewayConfig:
                         ("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER"),
                     ):
                         if yaml_key in allow_mentions_cfg and not os.getenv(env_key):
-                            os.environ[env_key] = str(allow_mentions_cfg[yaml_key]).lower()
+                            value = allow_mentions_cfg[yaml_key]
+                            if isinstance(value, (list, tuple, set)):
+                                os.environ[env_key] = ",".join(str(v) for v in value)
+                            else:
+                                os.environ[env_key] = str(value).lower()
                 # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode
                 # YAML 1.1 parses bare 'off' as boolean False — coerce to string "off".
                 _discord_extra = discord_cfg.get("extra") if isinstance(discord_cfg.get("extra"), dict) else {}

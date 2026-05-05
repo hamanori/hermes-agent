@@ -20,7 +20,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
-from typing import Callable, Dict, List, Optional, Any, Tuple
+from typing import Callable, Dict, List, Optional, Any, Tuple, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +105,8 @@ def _build_allowed_mentions():
 
         DISCORD_ALLOW_MENTION_EVERYONE      default false  — @everyone + @here
         DISCORD_ALLOW_MENTION_ROLES         default false  — @role pings
-        DISCORD_ALLOW_MENTION_USERS         default true   — @user pings
+        DISCORD_ALLOW_MENTION_USERS         default true   — @user pings,
+                                                     or a comma-separated allowlist
         DISCORD_ALLOW_MENTION_REPLIED_USER  default true   — reply-ping author
     """
     if not DISCORD_AVAILABLE:
@@ -117,10 +118,42 @@ def _build_allowed_mentions():
             return default
         return raw in ("true", "1", "yes", "on")
 
+    def _users(raw: str) -> bool | Sequence[Any]:
+        raw = raw.strip()
+        if not raw:
+            return True
+
+        lowered = raw.lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+
+        allowed_users = []
+        for entry in raw.split(","):
+            cleaned = _clean_discord_id(entry)
+            if not cleaned:
+                continue
+            if cleaned.isdigit():
+                allowed_users.append(discord.Object(id=int(cleaned)))
+            else:
+                logger.warning(
+                    "Ignoring non-numeric entry in DISCORD_ALLOW_MENTION_USERS: %r",
+                    cleaned,
+                )
+
+        if allowed_users:
+            return allowed_users
+
+        logger.warning(
+            "DISCORD_ALLOW_MENTION_USERS had no usable entries; disabling user pings"
+        )
+        return False
+
     return discord.AllowedMentions(
         everyone=_b("DISCORD_ALLOW_MENTION_EVERYONE", False),
         roles=_b("DISCORD_ALLOW_MENTION_ROLES", False),
-        users=_b("DISCORD_ALLOW_MENTION_USERS", True),
+        users=_users(os.getenv("DISCORD_ALLOW_MENTION_USERS", "")),
         replied_user=_b("DISCORD_ALLOW_MENTION_REPLIED_USER", True),
     )
 

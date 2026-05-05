@@ -42,6 +42,7 @@ def _ensure_discord_mock():
     """
     if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
         sys.modules["discord"].AllowedMentions = _FakeAllowedMentions
+        sys.modules["discord"].Object = lambda id: SimpleNamespace(id=id)
         return
 
     if sys.modules.get("discord") is None:
@@ -52,6 +53,7 @@ def _ensure_discord_mock():
         discord_mod.DMChannel = type("DMChannel", (), {})
         discord_mod.Thread = type("Thread", (), {})
         discord_mod.ForumChannel = type("ForumChannel", (), {})
+        discord_mod.Object = lambda id: SimpleNamespace(id=id)
         discord_mod.ui = SimpleNamespace(View=object, button=lambda *a, **k: (lambda fn: fn), Button=object)
         discord_mod.ButtonStyle = SimpleNamespace(success=1, primary=2, danger=3, green=1, blurple=2, red=3, grey=4, secondary=5)
         discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4)
@@ -77,6 +79,7 @@ def _ensure_discord_mock():
     # by another test's _ensure_discord_mock, force the AllowedMentions
     # stand-in onto it — _build_allowed_mentions() reads this attribute.
     sys.modules["discord"].AllowedMentions = _FakeAllowedMentions
+    sys.modules["discord"].Object = lambda id: SimpleNamespace(id=id)
 
 
 _ensure_discord_mock()
@@ -123,6 +126,16 @@ def test_env_var_can_disable_users(monkeypatch):
     am = _build_allowed_mentions()
     assert am.users is False
     # safe defaults elsewhere remain
+    assert am.everyone is False
+    assert am.roles is False
+    assert am.replied_user is True
+
+
+def test_env_var_can_allowlist_users(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_USERS", "739715021029769277, 123456789012345678")
+    am = _build_allowed_mentions()
+    assert isinstance(am.users, list)
+    assert [u.id for u in am.users] == [739715021029769277, 123456789012345678]
     assert am.everyone is False
     assert am.roles is False
     assert am.replied_user is True

@@ -46,6 +46,7 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
             "HERMES_AGENT_TIMEOUT_WARNING",
             "HERMES_GATEWAY_BUSY_INPUT_MODE",
             "HERMES_TIMEZONE",
+            "DISCORD_ALLOW_MENTION_USERS",
         ):
             v = os.environ.get(k)
             if v is not None:
@@ -80,13 +81,15 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
 
 
 def _write_config(home: Path, agent_cfg: dict | None = None, display_cfg: dict | None = None,
-                  timezone: str | None = None) -> None:
+                  discord_cfg: dict | None = None, timezone: str | None = None) -> None:
     import yaml
     cfg: dict = {}
     if agent_cfg:
         cfg["agent"] = agent_cfg
     if display_cfg:
         cfg["display"] = display_cfg
+    if discord_cfg:
+        cfg["discord"] = discord_cfg
     if timezone:
         cfg["timezone"] = timezone
     (home / "config.yaml").write_text(yaml.safe_dump(cfg))
@@ -164,3 +167,14 @@ def test_env_value_survives_when_config_omits_key(hermes_home: Path) -> None:
     env = _run_gateway_import(hermes_home, initial_env={})
 
     assert env.get("HERMES_MAX_ITERATIONS") == "123"
+
+
+def test_discord_allow_mentions_users_list_serializes_to_env(hermes_home: Path) -> None:
+    _write_config(
+        hermes_home,
+        discord_cfg={"allow_mentions": {"users": ["739715021029769277", "123456789012345678"]}},
+    )
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env.get("DISCORD_ALLOW_MENTION_USERS") == "739715021029769277,123456789012345678"
