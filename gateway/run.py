@@ -435,6 +435,23 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_BUSY_INPUT_MODE"] = str(_display_cfg["busy_input_mode"])
             if "busy_ack_enabled" in _display_cfg:
                 os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = str(_display_cfg["busy_ack_enabled"])
+        _discord_cfg = _cfg.get("discord", {})
+        if _discord_cfg and isinstance(_discord_cfg, dict):
+            _allow_mentions_cfg = _discord_cfg.get("allow_mentions")
+            if isinstance(_allow_mentions_cfg, dict):
+                for _yaml_key, _env_key in (
+                    ("everyone", "DISCORD_ALLOW_MENTION_EVERYONE"),
+                    ("roles", "DISCORD_ALLOW_MENTION_ROLES"),
+                    ("users", "DISCORD_ALLOW_MENTION_USERS"),
+                    ("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER"),
+                ):
+                    if _yaml_key not in _allow_mentions_cfg:
+                        continue
+                    _value = _allow_mentions_cfg[_yaml_key]
+                    if isinstance(_value, (list, tuple, set)):
+                        os.environ[_env_key] = ",".join(str(v) for v in _value)
+                    else:
+                        os.environ[_env_key] = str(_value).lower()
         # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
         _tz_cfg = _cfg.get("timezone", "")
         if _tz_cfg and isinstance(_tz_cfg, str):

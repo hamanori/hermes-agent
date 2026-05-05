@@ -837,7 +837,11 @@ def load_gateway_config() -> GatewayConfig:
                         ("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER"),
                     ):
                         if yaml_key in allow_mentions_cfg and not os.getenv(env_key):
-                            os.environ[env_key] = str(allow_mentions_cfg[yaml_key]).lower()
+                            value = allow_mentions_cfg[yaml_key]
+                            if isinstance(value, (list, tuple, set)):
+                                os.environ[env_key] = ",".join(str(v) for v in value)
+                            else:
+                                os.environ[env_key] = str(value).lower()
 
             # Telegram settings → env vars (env vars take precedence)
             telegram_cfg = yaml_cfg.get("telegram", {})
