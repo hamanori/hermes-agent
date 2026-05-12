@@ -19,6 +19,16 @@ logger = logging.getLogger(__name__)
 FailureCallback = Callable[[str, BaseException], None]
 TitleCallback = Callable[[str], None]
 
+_TITLE_CONTEXT_CHARS = 1500
+_TITLE_MAX_TOKENS = 64
+
+
+def _recent_snippet(text: str, limit: int = _TITLE_CONTEXT_CHARS) -> str:
+    """Return the recent tail of *text* so title generation sees latest context."""
+    if not text:
+        return ""
+    return text[-limit:]
+
 _TITLE_PROMPT = (
     "Generate a compact, descriptive conversation title. Capture the concrete task/outcome, "
     "not a generic category. Prefer Japanese when the conversation is Japanese. "
@@ -46,9 +56,11 @@ def generate_title(
     ``AIAgent._emit_auxiliary_failure`` so the user sees a warning instead
     of silently accumulating untitled sessions.
     """
-    # Truncate long messages to keep the request small
-    user_snippet = user_message[:500] if user_message else ""
-    assistant_snippet = assistant_response[:500] if assistant_response else ""
+    # Keep the request small, but prefer the most recent part of long messages
+    # because Discord title updates run after each turn and the latest decision
+    # is usually at the end of the assistant/user text.
+    user_snippet = _recent_snippet(user_message)
+    assistant_snippet = _recent_snippet(assistant_response)
 
     messages = [
         {"role": "system", "content": _TITLE_PROMPT},
@@ -59,7 +71,7 @@ def generate_title(
         response = call_llm(
             task="title_generation",
             messages=messages,
-            max_tokens=500,
+            max_tokens=_TITLE_MAX_TOKENS,
             temperature=0.3,
             timeout=timeout,
             main_runtime=main_runtime,

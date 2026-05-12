@@ -95,8 +95,31 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", side_effect=RuntimeError("nope")):
             assert generate_title("q", "a") is None
 
-    def test_truncates_long_messages(self):
-        """Long user/assistant messages should be truncated in the LLM request."""
+    def test_truncates_long_messages_from_recent_tail(self):
+        """Long user/assistant messages should keep the recent tail for title context."""
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Short Title"
+            return resp
+
+        user_message = "VERY OLD USER CONTEXT " + ("old-user " * 400) + "RECENT USER DECISION"
+        assistant_response = "VERY OLD ASSISTANT CONTEXT " + ("old-assistant " * 400) + "RECENT ASSISTANT OUTCOME"
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            generate_title(user_message, assistant_response)
+
+        user_content = captured_kwargs["messages"][1]["content"]
+        assert "RECENT USER DECISION" in user_content
+        assert "RECENT ASSISTANT OUTCOME" in user_content
+        assert "VERY OLD USER CONTEXT" not in user_content
+        assert "VERY OLD ASSISTANT CONTEXT" not in user_content
+        assert len(user_content) < 3200  # 1500 + 1500 + formatting
+
+    def test_title_generation_uses_small_output_budget(self):
         captured_kwargs = {}
 
         def mock_call_llm(**kwargs):
@@ -107,11 +130,9 @@ class TestGenerateTitle:
             return resp
 
         with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
-            generate_title("x" * 1000, "y" * 1000)
+            generate_title("question", "answer")
 
-        # The user content in the messages should be truncated
-        user_content = captured_kwargs["messages"][1]["content"]
-        assert len(user_content) < 1100  # 500 + 500 + formatting
+        assert captured_kwargs["max_tokens"] == 64
 
 
 class TestAutoTitleSession:
