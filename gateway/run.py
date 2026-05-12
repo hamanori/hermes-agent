@@ -7225,7 +7225,7 @@ class GatewayRunner:
                 except Exception:
                     pass
 
-            await adapter.update_thread_title(str(source.thread_id), title)
+            await adapter.update_thread_title(str(source.thread_id), title, user_message=user_message)
         except Exception as e:
             logger.debug("Discord thread title auto-update skipped: %s", e, exc_info=True)
     def _format_session_info(self) -> str:

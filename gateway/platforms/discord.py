@@ -4417,17 +4417,56 @@ class DiscordAdapter(BasePlatformAdapter):
         name = name.strip(" \"'`*_。.!?！？:：-—")
         # Avoid low-information generic prefixes in the Discord sidebar.
         name = re.sub(r"^(相談|ニュース|Discord整理|Hermes設定|タスク整理)[:：\s-]+", "", name).strip()
+        if self._looks_like_bad_thread_title(name):
+            name = self._compact_bad_thread_title(name)
         if not name:
             name = "Hermes相談"
         if len(name) > 48:
             name = name[:47].rstrip() + "…"
         return name
 
-    async def update_thread_title(self, thread_id: str, title: str) -> bool:
+    def _looks_like_bad_thread_title(self, name: str) -> bool:
+        """Detect titles that are really answer snippets or markdown outlines."""
+        if not name:
+            return False
+        bad_markers = ("以下に示します", "##", "**", "```", "\n", "1.", "要点", "整理案")
+        return len(name) > 24 and any(marker in name for marker in bad_markers)
+
+    def _compact_bad_thread_title(self, name: str) -> str:
+        """Turn common verbose generated titles into glanceable sidebar labels."""
+        compact = name
+        replacements = (
+            (r"スレッド内容の?整理案.*", "スレッド内容整理"),
+            (r".*Discord.*スレ.*名.*", "Discordスレ名仕様"),
+            (r".*Hermes.*(?:設定|運用|自動化).*", "Hermes運用整理"),
+        )
+        for pattern, replacement in replacements:
+            if re.search(pattern, compact, flags=re.IGNORECASE):
+                return replacement
+        compact = re.split(r"[。.!?！？#*`\n]", compact, maxsplit=1)[0]
+        compact = compact.replace("以下に示します", "").replace("整理案", "整理")
+        return compact[:24].strip(" \"'`*_。.!?！？:：-—")
+
+    def _fallback_thread_title_from_user_message(self, user_message: str) -> str:
+        """Derive a compact fallback when LLM title generation is empty or unusable."""
+        text = (user_message or "").strip()
+        lower = text.lower()
+        if "discord" in lower and ("スレ" in text or "thread" in lower) and "名" in text:
+            return "Discordスレ名仕様"
+        if "hermes" in lower and ("設定" in text or "運用" in text):
+            return "Hermes運用整理"
+        title = self._derive_auto_thread_name(text)
+        return self._sanitize_thread_title(title)
+
+    async def update_thread_title(self, thread_id: str, title: str, user_message: str = "") -> bool:
         """Best-effort rename of a Discord thread from a generated conversation title."""
-        if not self._client or not thread_id or not title:
+        if not self._client or not thread_id or (not title and not user_message):
             return False
         new_name = self._sanitize_thread_title(title)
+        if self._looks_like_bad_thread_title(new_name):
+            new_name = ""
+        if (not new_name or title == new_name or "…" in new_name or "どんな感じ" in new_name) and user_message:
+            new_name = self._fallback_thread_title_from_user_message(user_message)
         try:
             thread = self._client.get_channel(int(thread_id))
             if not thread:

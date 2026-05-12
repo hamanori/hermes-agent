@@ -240,6 +240,32 @@ async def test_update_thread_title_renames_and_sanitizes(adapter):
     assert thread.edit_calls
 
 
+def test_sanitize_thread_title_rejects_verbose_markdown_answer(adapter):
+    title = adapter._sanitize_thread_title(
+        "スレッド内容の整理案を以下に示します。 ## 1. 知識として残すべき要点 **💡 コアとなる…"
+    )
+
+    assert title == "スレッド内容整理"
+    assert len(title) <= 24
+
+
+@pytest.mark.asyncio
+async def test_update_thread_title_uses_user_message_fallback_for_bad_generated_title(adapter):
+    thread = FakeThread(channel_id=777, name="Discord整理: 今ってDiscordのスレ名ってどんな感じ…")
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda channel_id: thread if channel_id == 777 else None,
+        fetch_channel=AsyncMock(return_value=None),
+    )
+
+    renamed = await adapter.update_thread_title(
+        "777",
+        "Discord整理: 今ってDiscordのスレ名ってどんな感じ…",
+        user_message="今ってDiscordのスレ名ってどんな感じのアルゴリズムになってんだっけ？",
+    )
+
+    assert renamed is True
+    assert thread.name == "Discordスレ名仕様"
 # ── no_thread_channels ───────────────────────────────────────────────
 
 
