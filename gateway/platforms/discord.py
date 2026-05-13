@@ -4378,7 +4378,7 @@ class DiscordAdapter(BasePlatformAdapter):
         text = re.sub(r"https?://\S+", "URL", text)
         text = re.sub(r"\s+", " ", text).strip(" -—:：。.!?？")
         if not text:
-            return "Hermes相談"
+            return "相談"
 
         lower = text.lower()
         buckets = [
@@ -4420,7 +4420,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if self._looks_like_bad_thread_title(name):
             name = self._compact_bad_thread_title(name)
         if not name:
-            name = "Hermes相談"
+            name = "相談"
         if len(name) > 48:
             name = name[:47].rstrip() + "…"
         return name

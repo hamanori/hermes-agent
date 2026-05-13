@@ -221,7 +221,12 @@ def test_auto_thread_name_is_compact_and_categorized(adapter):
 
 def test_auto_thread_name_strips_mentions_urls_and_falls_back(adapter):
     assert adapter._derive_auto_thread_name("<@123> <#456> https://example.com") == "相談: URL"
-    assert adapter._derive_auto_thread_name("<@123>   ") == "Hermes相談"
+    assert adapter._derive_auto_thread_name("<@123>   ") == "相談"
+
+
+def test_sanitize_thread_title_does_not_emit_repeated_hermes_consultation(adapter):
+    assert adapter._sanitize_thread_title("") == "相談"
+    assert adapter._sanitize_thread_title("相談:   ") == "相談"
 
 
 @pytest.mark.asyncio

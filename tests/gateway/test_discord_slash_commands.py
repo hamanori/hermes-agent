@@ -762,10 +762,11 @@ async def test_auto_create_thread_strips_mention_syntax_from_name(adapter):
 
 
 @pytest.mark.asyncio
-async def test_auto_create_thread_falls_back_to_hermes_when_only_mentions(adapter):
+async def test_auto_create_thread_falls_back_to_generic_consultation_when_only_mentions(adapter):
     """If a message contains only mention syntax, the stripped content is
-    empty — fall back to the 'Hermes' default rather than ''."""
-    thread = SimpleNamespace(id=999, name="Hermes")
+    empty — fall back to a plain consultation default rather than repeated
+    Hermes相談 titles."""
+    thread = SimpleNamespace(id=999, name="相談")
     message = SimpleNamespace(
         content="<@&1490963422786093149>",
         create_thread=AsyncMock(return_value=thread),
@@ -776,7 +777,7 @@ async def test_auto_create_thread_falls_back_to_hermes_when_only_mentions(adapte
     await adapter._auto_create_thread(message)
 
     name = message.create_thread.await_args[1]["name"]
-    assert name == "Hermes相談"
+    assert name == "相談"
 
 
 @pytest.mark.asyncio
