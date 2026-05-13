@@ -364,12 +364,13 @@ class TestNewInHelp:
 
 
 @pytest.mark.asyncio
-async def test_maybe_update_discord_thread_title_logs_empty_generated_title(monkeypatch, caplog):
+async def test_maybe_update_discord_thread_title_falls_back_when_generated_title_empty(monkeypatch, caplog):
     from gateway.run import GatewayRunner
     import gateway.run as gateway_run
 
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(return_value=True))
     runner = object.__new__(GatewayRunner)
-    runner.adapters = {Platform.DISCORD: SimpleNamespace(update_thread_title=AsyncMock())}
+    runner.adapters = {Platform.DISCORD: adapter}
     runner._session_db = None
     source = SessionSource(
         platform=Platform.DISCORD,
@@ -388,9 +389,9 @@ async def test_maybe_update_discord_thread_title_logs_empty_generated_title(monk
         agent_messages=[],
     )
 
-    assert "reason=empty_generated_title" in caplog.text
+    assert "reason=empty_generated_title_fallback" in caplog.text
     assert "thread_id=777" in caplog.text
-    runner.adapters[Platform.DISCORD].update_thread_title.assert_not_awaited()
+    adapter.update_thread_title.assert_awaited_once_with("777", "", user_message="Discordのスレ名を直して")
 
 
 @pytest.mark.asyncio
