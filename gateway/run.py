@@ -7230,7 +7230,7 @@ class GatewayRunner:
             safe_title = (title or "")[:80]
             if not title:
                 logger.info(
-                    "Discord thread title auto-update skipped: reason=empty_generated_title thread_id=%s session_id=%s",
+                    "Discord thread title auto-update skipped: reason=empty_generated_title media_policy=text_only_no_image_analysis thread_id=%s session_id=%s",
                     thread_id,
                     session_id,
                 )

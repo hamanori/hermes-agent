@@ -390,6 +390,7 @@ async def test_maybe_update_discord_thread_title_skips_when_generated_title_empt
     )
 
     assert "reason=empty_generated_title" in caplog.text
+    assert "media_policy=text_only_no_image_analysis" in caplog.text
     assert "thread_id=777" in caplog.text
     adapter.update_thread_title.assert_not_awaited()
 
