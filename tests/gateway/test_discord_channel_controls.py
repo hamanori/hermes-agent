@@ -255,7 +255,7 @@ def test_sanitize_thread_title_rejects_verbose_markdown_answer(adapter):
 
 
 @pytest.mark.asyncio
-async def test_update_thread_title_uses_user_message_fallback_for_bad_generated_title(adapter, caplog):
+async def test_update_thread_title_rejects_bad_generated_title_without_fallback(adapter, caplog):
     caplog.set_level("INFO", logger=discord_platform.logger.name)
     thread = FakeThread(channel_id=777, name="Discord整理: 今ってDiscordのスレ名ってどんな感じ…")
     adapter._client = SimpleNamespace(
@@ -270,9 +270,11 @@ async def test_update_thread_title_uses_user_message_fallback_for_bad_generated_
         user_message="今ってDiscordのスレ名ってどんな感じのアルゴリズムになってんだっけ？",
     )
 
-    assert renamed is True
-    assert thread.name == "Discordスレ名仕様"
-    assert "fallback_used" in caplog.text
+    assert renamed is False
+    assert thread.name == "Discord整理: 今ってDiscordのスレ名ってどんな感じ…"
+    assert not thread.edit_calls
+    assert "bad_generated_title" in caplog.text
+    assert "fallback_used" not in caplog.text
 
 
 @pytest.mark.asyncio

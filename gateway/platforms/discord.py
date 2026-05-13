@@ -4470,27 +4470,19 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.info("[%s] Discord thread title update skipped: reason=no_title_or_user_message thread_id=%s", self.name, thread_id)
             return False
 
+        if not title:
+            logger.info("[%s] Discord thread title update skipped: reason=no_generated_title thread_id=%s", self.name, thread_id)
+            return False
+
         new_name = self._sanitize_thread_title(title)
-        if self._looks_like_bad_thread_title(new_name):
+        if self._looks_like_bad_thread_title(new_name) or "…" in new_name or "どんな感じ" in new_name:
             logger.info(
                 "[%s] Discord thread title candidate rejected: reason=bad_generated_title thread_id=%s candidate=%r",
                 self.name,
                 thread_id,
                 new_name,
             )
-            new_name = ""
-
-        fallback_needed = not new_name or title == new_name or "…" in new_name or "どんな感じ" in new_name
-        if fallback_needed and user_message:
-            fallback_name = self._fallback_thread_title_from_user_message(user_message)
-            logger.info(
-                "[%s] Discord thread title fallback_used: thread_id=%s generated=%r fallback=%r",
-                self.name,
-                thread_id,
-                new_name,
-                fallback_name,
-            )
-            new_name = fallback_name
+            return False
 
         try:
             thread = self._client.get_channel(int(thread_id))

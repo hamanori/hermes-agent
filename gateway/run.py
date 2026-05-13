@@ -7230,17 +7230,10 @@ class GatewayRunner:
             safe_title = (title or "")[:80]
             if not title:
                 logger.info(
-                    "Discord thread title auto-update generated empty title; using Discord adapter fallback: reason=empty_generated_title_fallback thread_id=%s session_id=%s",
+                    "Discord thread title auto-update skipped: reason=empty_generated_title thread_id=%s session_id=%s",
                     thread_id,
                     session_id,
                 )
-                renamed = await adapter.update_thread_title(thread_id, "", user_message=user_message)
-                if not renamed:
-                    logger.info(
-                        "Discord thread title auto-update skipped: reason=fallback_adapter_returned_false thread_id=%s session_id=%s",
-                        thread_id,
-                        session_id,
-                    )
                 return
 
             logger.info(

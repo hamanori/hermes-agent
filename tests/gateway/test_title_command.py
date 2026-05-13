@@ -364,7 +364,7 @@ class TestNewInHelp:
 
 
 @pytest.mark.asyncio
-async def test_maybe_update_discord_thread_title_falls_back_when_generated_title_empty(monkeypatch, caplog):
+async def test_maybe_update_discord_thread_title_skips_when_generated_title_empty(monkeypatch, caplog):
     from gateway.run import GatewayRunner
     import gateway.run as gateway_run
 
@@ -389,9 +389,9 @@ async def test_maybe_update_discord_thread_title_falls_back_when_generated_title
         agent_messages=[],
     )
 
-    assert "reason=empty_generated_title_fallback" in caplog.text
+    assert "reason=empty_generated_title" in caplog.text
     assert "thread_id=777" in caplog.text
-    adapter.update_thread_title.assert_awaited_once_with("777", "", user_message="Discordのスレ名を直して")
+    adapter.update_thread_title.assert_not_awaited()
 
 
 @pytest.mark.asyncio
