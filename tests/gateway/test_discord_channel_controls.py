@@ -250,7 +250,8 @@ def test_sanitize_thread_title_rejects_verbose_markdown_answer(adapter):
 
 
 @pytest.mark.asyncio
-async def test_update_thread_title_uses_user_message_fallback_for_bad_generated_title(adapter):
+async def test_update_thread_title_uses_user_message_fallback_for_bad_generated_title(adapter, caplog):
+    caplog.set_level("INFO", logger=discord_platform.logger.name)
     thread = FakeThread(channel_id=777, name="Discord整理: 今ってDiscordのスレ名ってどんな感じ…")
     adapter._client = SimpleNamespace(
         user=SimpleNamespace(id=999),
@@ -266,6 +267,77 @@ async def test_update_thread_title_uses_user_message_fallback_for_bad_generated_
 
     assert renamed is True
     assert thread.name == "Discordスレ名仕様"
+    assert "fallback_used" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_update_thread_title_logs_fetch_not_found_reason(adapter, caplog):
+    caplog.set_level("INFO", logger=discord_platform.logger.name)
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda channel_id: None,
+        fetch_channel=AsyncMock(return_value=None),
+    )
+
+    renamed = await adapter.update_thread_title("777", "Discordスレ名更新")
+
+    assert renamed is False
+    assert "fetch_channel_not_found" in caplog.text
+    assert "777" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_update_thread_title_logs_non_thread_reason(adapter, caplog):
+    caplog.set_level("INFO", logger=discord_platform.logger.name)
+    channel = FakeTextChannel(channel_id=777, name="general")
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda channel_id: channel,
+        fetch_channel=AsyncMock(return_value=None),
+    )
+
+    renamed = await adapter.update_thread_title("777", "Discordスレ名更新")
+
+    assert renamed is False
+    assert "fetched_non_thread" in caplog.text
+    assert "FakeTextChannel" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_update_thread_title_logs_unchanged_reason(adapter, caplog):
+    caplog.set_level("INFO", logger=discord_platform.logger.name)
+    thread = FakeThread(channel_id=777, name="Discordスレ名更新")
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda channel_id: thread,
+        fetch_channel=AsyncMock(return_value=None),
+    )
+
+    renamed = await adapter.update_thread_title("777", "Discordスレ名更新")
+
+    assert renamed is False
+    assert "unchanged" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_update_thread_title_logs_edit_exception_reason(adapter, caplog):
+    caplog.set_level("INFO", logger=discord_platform.logger.name)
+    class FailingThread(FakeThread):
+        async def edit(self, **kwargs):
+            raise RuntimeError("discord edit boom")
+
+    thread = FailingThread(channel_id=777, name="old name")
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=999),
+        get_channel=lambda channel_id: thread,
+        fetch_channel=AsyncMock(return_value=None),
+    )
+
+    renamed = await adapter.update_thread_title("777", "Discordスレ名更新")
+
+    assert renamed is False
+    assert "edit_failed" in caplog.text
+    assert "discord edit boom" in caplog.text
 # ── no_thread_channels ───────────────────────────────────────────────
 
 

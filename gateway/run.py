@@ -7198,10 +7198,23 @@ class GatewayRunner:
         try:
             if source.platform != Platform.DISCORD or not getattr(source, "thread_id", None):
                 return
+            thread_id = str(source.thread_id)
             adapter = self.adapters.get(source.platform)
             if not adapter or not hasattr(adapter, "update_thread_title"):
+                logger.info(
+                    "Discord thread title auto-update skipped: reason=adapter_missing thread_id=%s session_id=%s",
+                    thread_id,
+                    session_id,
+                )
                 return
             if not user_message or not assistant_response:
+                logger.info(
+                    "Discord thread title auto-update skipped: reason=empty_turn_text thread_id=%s session_id=%s user_present=%s assistant_present=%s",
+                    thread_id,
+                    session_id,
+                    bool(user_message),
+                    bool(assistant_response),
+                )
                 return
 
             from agent.title_generator import generate_title
@@ -7214,20 +7227,51 @@ class GatewayRunner:
                 None,
                 None,
             )
+            safe_title = (title or "")[:80]
             if not title:
+                logger.info(
+                    "Discord thread title auto-update skipped: reason=empty_generated_title thread_id=%s session_id=%s",
+                    thread_id,
+                    session_id,
+                )
                 return
+
+            logger.info(
+                "Discord thread title auto-update generated: thread_id=%s session_id=%s title=%r",
+                thread_id,
+                session_id,
+                safe_title,
+            )
 
             # Keep the internal session title aligned too, but do not let DB
             # failures block the visible Discord rename.
             if getattr(self, "_session_db", None) and session_id:
                 try:
                     self._session_db.set_session_title(session_id, title)
-                except Exception:
-                    pass
+                    logger.info(
+                        "Discord thread title auto-update stored session title: thread_id=%s session_id=%s title=%r",
+                        thread_id,
+                        session_id,
+                        safe_title,
+                    )
+                except Exception as db_error:
+                    logger.info(
+                        "Discord thread title auto-update skipped DB title store: reason=db_set_failed thread_id=%s session_id=%s error=%s",
+                        thread_id,
+                        session_id,
+                        db_error,
+                    )
 
-            await adapter.update_thread_title(str(source.thread_id), title, user_message=user_message)
+            renamed = await adapter.update_thread_title(thread_id, title, user_message=user_message)
+            if not renamed:
+                logger.info(
+                    "Discord thread title auto-update skipped: reason=adapter_returned_false thread_id=%s session_id=%s title=%r",
+                    thread_id,
+                    session_id,
+                    safe_title,
+                )
         except Exception as e:
-            logger.debug("Discord thread title auto-update skipped: %s", e, exc_info=True)
+            logger.info("Discord thread title auto-update skipped: reason=exception error=%s", e, exc_info=True)
     def _format_session_info(self) -> str:
         """Resolve current model config and return a formatted info block.
 

@@ -4460,27 +4460,67 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def update_thread_title(self, thread_id: str, title: str, user_message: str = "") -> bool:
         """Best-effort rename of a Discord thread from a generated conversation title."""
-        if not self._client or not thread_id or (not title and not user_message):
+        if not self._client:
+            logger.info("[%s] Discord thread title update skipped: reason=no_client thread_id=%r", self.name, thread_id)
             return False
+        if not thread_id:
+            logger.info("[%s] Discord thread title update skipped: reason=missing_thread_id", self.name)
+            return False
+        if not title and not user_message:
+            logger.info("[%s] Discord thread title update skipped: reason=no_title_or_user_message thread_id=%s", self.name, thread_id)
+            return False
+
         new_name = self._sanitize_thread_title(title)
         if self._looks_like_bad_thread_title(new_name):
+            logger.info(
+                "[%s] Discord thread title candidate rejected: reason=bad_generated_title thread_id=%s candidate=%r",
+                self.name,
+                thread_id,
+                new_name,
+            )
             new_name = ""
-        if (not new_name or title == new_name or "…" in new_name or "どんな感じ" in new_name) and user_message:
-            new_name = self._fallback_thread_title_from_user_message(user_message)
+
+        fallback_needed = not new_name or title == new_name or "…" in new_name or "どんな感じ" in new_name
+        if fallback_needed and user_message:
+            fallback_name = self._fallback_thread_title_from_user_message(user_message)
+            logger.info(
+                "[%s] Discord thread title fallback_used: thread_id=%s generated=%r fallback=%r",
+                self.name,
+                thread_id,
+                new_name,
+                fallback_name,
+            )
+            new_name = fallback_name
+
         try:
             thread = self._client.get_channel(int(thread_id))
             if not thread:
                 thread = await self._client.fetch_channel(int(thread_id))
-            if not thread or not isinstance(thread, discord.Thread):
+            if not thread:
+                logger.info("[%s] Discord thread title update skipped: reason=fetch_channel_not_found thread_id=%s", self.name, thread_id)
+                return False
+            if not isinstance(thread, discord.Thread):
+                logger.info(
+                    "[%s] Discord thread title update skipped: reason=fetched_non_thread thread_id=%s fetched_type=%s",
+                    self.name,
+                    thread_id,
+                    type(thread).__name__,
+                )
                 return False
             old_name = getattr(thread, "name", "") or ""
             if old_name == new_name:
+                logger.info(
+                    "[%s] Discord thread title update skipped: reason=unchanged thread_id=%s name=%r",
+                    self.name,
+                    thread_id,
+                    old_name,
+                )
                 return False
             await thread.edit(name=new_name, reason="Hermes auto-updated thread title from conversation context")
             logger.info("[%s] Renamed Discord thread %s: %r -> %r", self.name, thread_id, old_name, new_name)
             return True
         except Exception as e:
-            logger.debug("[%s] Failed to rename Discord thread %s: %s", self.name, thread_id, e, exc_info=True)
+            logger.warning("[%s] Discord thread title update failed: reason=edit_failed thread_id=%s error=%s", self.name, thread_id, e, exc_info=True)
             return False
 
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:

@@ -356,3 +356,71 @@ class TestNewInHelp:
         new_line = next((line for line in lines if line.startswith("`/new ")), None)
         assert new_line is not None
         assert "[name]" in new_line
+
+
+# ---------------------------------------------------------------------------
+# Discord thread auto-title observation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_discord_thread_title_logs_empty_generated_title(monkeypatch, caplog):
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: SimpleNamespace(update_thread_title=AsyncMock())}
+    runner._session_db = None
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+    monkeypatch.setattr("agent.title_generator.generate_title", lambda *args, **kwargs: "")
+    caplog.set_level("INFO", logger=gateway_run.logger.name)
+
+    await runner._maybe_update_discord_thread_title(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名を直して",
+        assistant_response="対応します",
+        agent_messages=[],
+    )
+
+    assert "reason=empty_generated_title" in caplog.text
+    assert "thread_id=777" in caplog.text
+    runner.adapters[Platform.DISCORD].update_thread_title.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_discord_thread_title_logs_adapter_false(monkeypatch, caplog):
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(return_value=False))
+    session_db = MagicMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_db = session_db
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+    monkeypatch.setattr("agent.title_generator.generate_title", lambda *args, **kwargs: "Discordスレ名更新")
+    caplog.set_level("INFO", logger=gateway_run.logger.name)
+
+    await runner._maybe_update_discord_thread_title(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名を直して",
+        assistant_response="対応します",
+        agent_messages=[],
+    )
+
+    session_db.set_session_title.assert_called_once_with("session-1", "Discordスレ名更新")
+    adapter.update_thread_title.assert_awaited_once_with("777", "Discordスレ名更新", user_message="Discordのスレ名を直して")
+    assert "reason=adapter_returned_false" in caplog.text
+    assert "title='Discordスレ名更新'" in caplog.text
