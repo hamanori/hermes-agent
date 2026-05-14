@@ -13736,8 +13736,14 @@ class GatewayRunner:
                             break
                     if adapter and chat_id:
                         try:
-                            send_meta = {"thread_id": thread_id} if thread_id else None
-                            await adapter.send(chat_id, message_text, metadata=send_meta)
+                            send_meta = (
+                                {"thread_lifecycle_buttons": False}
+                                if platform_name == Platform.DISCORD.value
+                                else {}
+                            )
+                            if thread_id:
+                                send_meta["thread_id"] = thread_id
+                            await adapter.send(chat_id, message_text, metadata=send_meta or None)
                         except Exception as e:
                             logger.error("Watcher delivery error: %s", e)
                 break
@@ -13757,8 +13763,14 @@ class GatewayRunner:
                         break
                 if adapter and chat_id:
                     try:
-                        send_meta = {"thread_id": thread_id} if thread_id else None
-                        await adapter.send(chat_id, message_text, metadata=send_meta)
+                        send_meta = (
+                            {"thread_lifecycle_buttons": False}
+                            if platform_name == Platform.DISCORD.value
+                            else {}
+                        )
+                        if thread_id:
+                            send_meta["thread_id"] = thread_id
+                        await adapter.send(chat_id, message_text, metadata=send_meta or None)
                     except Exception as e:
                         logger.error("Watcher delivery error: %s", e)
 
@@ -14800,6 +14812,9 @@ class GatewayRunner:
             if _progress_thread_id == source.thread_id
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
+        if source.platform == Platform.DISCORD:
+            _progress_metadata = dict(_progress_metadata or {})
+            _progress_metadata["thread_lifecycle_buttons"] = False
         _progress_reply_to = (
             event_message_id
             if source.platform == Platform.FEISHU and source.thread_id and event_message_id
