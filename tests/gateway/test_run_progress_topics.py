@@ -38,12 +38,13 @@ class ProgressCaptureAdapter(BasePlatformAdapter):
         )
         return SendResult(success=True, message_id="progress-1")
 
-    async def edit_message(self, chat_id, message_id, content) -> SendResult:
+    async def edit_message(self, chat_id, message_id, content, **kwargs) -> SendResult:
         self.edits.append(
             {
                 "chat_id": chat_id,
                 "message_id": message_id,
                 "content": content,
+                "kwargs": kwargs,
             }
         )
         return SendResult(success=True, message_id=message_id)
@@ -209,6 +210,47 @@ async def test_run_agent_progress_stays_in_originating_topic(monkeypatch, tmp_pa
     ]
     assert adapter.edits
     assert all(call["metadata"] == {"thread_id": "17585"} for call in adapter.typing)
+
+
+@pytest.mark.asyncio
+async def test_run_agent_discord_progress_suppresses_thread_lifecycle_buttons(monkeypatch, tmp_path):
+    """Discord tool-progress bubbles should not render thread lifecycle buttons."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    import tools.terminal_tool  # noqa: F401 - register terminal emoji for this fake-agent test
+
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="111222333",
+        chat_type="group",
+        thread_id="555444333",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-discord-progress",
+        session_key="agent:main:discord:group:111222333:555444333",
+    )
+
+    expected_meta = {"thread_id": "555444333", "thread_lifecycle_buttons": False}
+    assert result["final_response"] == "done"
+    assert adapter.sent[0]["metadata"] == expected_meta
+    assert all(call["metadata"] == expected_meta for call in adapter.typing)
 
 
 @pytest.mark.asyncio
