@@ -1057,6 +1057,7 @@ class TestSendDiscordThreadId:
         mock_resp.status = response_status
         mock_resp.json = AsyncMock(return_value=response_data or {"id": "msg123"})
         mock_resp.text = AsyncMock(return_value=response_text)
+        mock_resp.headers = {}
 
         # mock_resp as async context manager (for "async with session.post(...) as resp")
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
@@ -1104,6 +1105,54 @@ class TestSendDiscordThreadId:
             result = self._run("tok", "111", "hi")
         assert "error" in result
         assert "403" in result["error"]
+
+    def test_text_send_uses_safe_allowed_mentions_defaults(self):
+        """Direct Discord REST sends deny everyone/role pings by default."""
+        mock_session, _ = self._build_mock(200)
+        with patch.dict(
+            os.environ,
+            {
+                "DISCORD_ALLOW_MENTION_EVERYONE": "",
+                "DISCORD_ALLOW_MENTION_ROLES": "",
+                "DISCORD_ALLOW_MENTION_USERS": "",
+                "DISCORD_ALLOW_MENTION_REPLIED_USER": "",
+            },
+            clear=False,
+        ), patch("aiohttp.ClientSession", return_value=mock_session):
+            result = self._run("tok", "111", "hi @everyone <@&123>")
+
+        assert result["success"] is True
+        payload = mock_session.post.call_args.kwargs["json"]
+        assert payload["allowed_mentions"] == {"parse": ["users"], "replied_user": True}
+
+    def test_429_retries_text_send_after_retry_after(self):
+        """Discord 429s are retried instead of surfacing immediately."""
+        rate_resp = MagicMock()
+        rate_resp.status = 429
+        rate_resp.headers = {"Retry-After": "0"}
+        rate_resp.text = AsyncMock(return_value='{"retry_after": 0}')
+        rate_resp.__aenter__ = AsyncMock(return_value=rate_resp)
+        rate_resp.__aexit__ = AsyncMock(return_value=None)
+
+        ok_resp = MagicMock()
+        ok_resp.status = 200
+        ok_resp.headers = {}
+        ok_resp.json = AsyncMock(return_value={"id": "after_retry"})
+        ok_resp.__aenter__ = AsyncMock(return_value=ok_resp)
+        ok_resp.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+        mock_session.post = MagicMock(side_effect=[rate_resp, ok_resp])
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), patch("asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            result = self._run("tok", "111", "hi")
+
+        assert result["success"] is True
+        assert result["message_id"] == "after_retry"
+        assert mock_session.post.call_count == 2
+        sleep_mock.assert_awaited_once_with(0.0)
 
 
 class TestSendToPlatformDiscordThread:
@@ -1163,6 +1212,7 @@ class TestSendDiscordMedia:
         mock_resp.status = response_status
         mock_resp.json = AsyncMock(return_value=response_data or {"id": "msg123"})
         mock_resp.text = AsyncMock(return_value=response_text)
+        mock_resp.headers = {}
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=None)
 
@@ -1203,6 +1253,42 @@ class TestSendDiscordMedia:
         assert result["success"] is True
         # Only one POST: the media upload (text was whitespace-only)
         assert mock_session.post.call_count == 1
+
+    def test_media_retry_rebuilds_formdata(self, tmp_path):
+        """Multipart uploads retry 429s with a fresh FormData object."""
+        img = tmp_path / "photo.png"
+        img.write_bytes(b"\x89PNG fake image data")
+
+        rate_resp = MagicMock()
+        rate_resp.status = 429
+        rate_resp.headers = {"Retry-After": "0"}
+        rate_resp.text = AsyncMock(return_value='{"retry_after": 0}')
+        rate_resp.__aenter__ = AsyncMock(return_value=rate_resp)
+        rate_resp.__aexit__ = AsyncMock(return_value=None)
+
+        ok_resp = MagicMock()
+        ok_resp.status = 200
+        ok_resp.headers = {}
+        ok_resp.json = AsyncMock(return_value={"id": "media_after_retry"})
+        ok_resp.__aenter__ = AsyncMock(return_value=ok_resp)
+        ok_resp.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+        mock_session.post = MagicMock(side_effect=[rate_resp, ok_resp])
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), patch("asyncio.sleep", new=AsyncMock()):
+            result = asyncio.run(
+                _send_discord("tok", "222", "  ", media_files=[(str(img), False)])
+            )
+
+        assert result["success"] is True
+        assert result["message_id"] == "media_after_retry"
+        assert mock_session.post.call_count == 2
+        first_data = mock_session.post.call_args_list[0].kwargs["data"]
+        second_data = mock_session.post.call_args_list[1].kwargs["data"]
+        assert first_data is not second_data
 
     def test_missing_media_file_collected_as_warning(self):
         """Non-existent media paths produce warnings but don't fail."""
@@ -1420,6 +1506,7 @@ class TestSendDiscordForum:
         mock_resp.status = response_status
         mock_resp.json = AsyncMock(return_value=response_data or {})
         mock_resp.text = AsyncMock(return_value=response_text)
+        mock_resp.headers = {}
         mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
         mock_resp.__aexit__ = AsyncMock(return_value=None)
 
@@ -1604,6 +1691,7 @@ class TestSendDiscordForumMedia:
         resp.status = 201
         resp.json = AsyncMock(return_value={"id": thread_id, "message": {"id": msg_id}})
         resp.text = AsyncMock(return_value="")
+        resp.headers = {}
         resp.__aenter__ = AsyncMock(return_value=resp)
         resp.__aexit__ = AsyncMock(return_value=None)
         return resp
