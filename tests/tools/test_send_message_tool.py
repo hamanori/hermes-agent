@@ -2567,8 +2567,6 @@ class TestCheckSendMessage:
              patch("gateway.status.is_gateway_running",
                    side_effect=ImportError("simulated")):
             assert _check_send_message() is False
-
-
 class TestSendTelegramThreadNotFoundRetry:
     """Tests for thread-not-found retry behaviour in _send_telegram (#27012)."""
 
@@ -2658,3 +2656,47 @@ class TestSendTelegramThreadNotFoundRetry:
             if media_path and os.path.exists(media_path):
                 os.unlink(media_path)
 
+
+@pytest.mark.asyncio
+async def test_send_to_platform_sends_discord_table_image_in_order(monkeypatch, tmp_path):
+    calls = []
+
+    async def fake_send_discord(token, chat_id, message, thread_id=None, media_files=None):
+        calls.append({"message": message, "media_files": media_files or [], "thread_id": thread_id})
+        return {"success": True, "message_id": str(len(calls))}
+
+    monkeypatch.setattr("gateway.markdown_table_images.render_table_pngs", lambda table, output_dir=None: [str(tmp_path / "table.png")])
+    monkeypatch.setattr("tools.send_message_tool._send_discord", fake_send_discord)
+
+    message = "Before\n\n| A | B |\n|---|---|\n| x | y |\n\nAfter"
+    cfg = SimpleNamespace(token="***", extra={})
+
+    result = await _send_to_platform(Platform.DISCORD, cfg, "123", message, thread_id="456")
+
+    assert result["success"] is True
+    assert calls == [
+        {"message": "Before\n\n", "media_files": [], "thread_id": "456"},
+        {"message": "", "media_files": [(str(tmp_path / "table.png"), False)], "thread_id": "456"},
+        {"message": "\nAfter", "media_files": [], "thread_id": "456"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_send_to_platform_uses_fenced_fallback_when_discord_table_render_fails(monkeypatch):
+    calls = []
+
+    async def fake_send_discord(token, chat_id, message, thread_id=None, media_files=None):
+        calls.append({"message": message, "media_files": media_files or []})
+        return {"success": True, "message_id": str(len(calls))}
+
+    def fail_render(table, output_dir=None):
+        raise RuntimeError("no renderer")
+
+    monkeypatch.setattr("gateway.markdown_table_images.render_table_pngs", fail_render)
+    monkeypatch.setattr("tools.send_message_tool._send_discord", fake_send_discord)
+
+    cfg = SimpleNamespace(token="***", extra={})
+    result = await _send_to_platform(Platform.DISCORD, cfg, "123", "| A | B |\n|---|---|\n| x | y |")
+
+    assert result["success"] is True
+    assert calls == [{"message": "```\n| A | B |\n|---|---|\n| x | y |\n```", "media_files": []}]
