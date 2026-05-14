@@ -4,6 +4,7 @@ Tests the _handle_title_command handler (set/show session titles)
 across all gateway messenger platforms.
 """
 
+import asyncio
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -361,6 +362,116 @@ class TestNewInHelp:
 # ---------------------------------------------------------------------------
 # Discord thread auto-title observation
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_schedule_discord_thread_title_update_returns_without_waiting(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    runner = object.__new__(GatewayRunner)
+    runner._background_tasks = set()
+
+    async def slow_update(**kwargs):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(runner, "_maybe_update_discord_thread_title", slow_update)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+
+    task = runner._schedule_discord_thread_title_update(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名を直して",
+        assistant_response="対応します",
+        agent_messages=[],
+    )
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert task is not None
+    assert not task.done()
+    assert task in runner._background_tasks
+    release.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert task not in runner._background_tasks
+
+
+@pytest.mark.asyncio
+async def test_schedule_discord_thread_title_update_observes_task_exception(monkeypatch, caplog):
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+
+    runner = object.__new__(GatewayRunner)
+    runner._background_tasks = set()
+
+    async def failing_update(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner, "_maybe_update_discord_thread_title", failing_update)
+    caplog.set_level("INFO", logger=gateway_run.logger.name)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+
+    task = runner._schedule_discord_thread_title_update(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名を直して",
+        assistant_response="対応します",
+        agent_messages=[],
+    )
+
+    try:
+        await asyncio.wait_for(task, timeout=1)
+    except RuntimeError:
+        pass
+    await asyncio.sleep(0)
+    assert "reason=task_exception" in caplog.text
+    assert "thread_id=777" in caplog.text
+    assert "session_id=session-1" in caplog.text
+    assert "boom" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_discord_thread_title_uses_long_background_timeout(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(return_value=True))
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_db = None
+    recorded = {}
+
+    def fake_generate_title(*args, **kwargs):
+        recorded["timeout"] = args[2]
+        return "Discordスレ名仕様"
+
+    monkeypatch.setattr("agent.title_generator.generate_title", fake_generate_title)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+
+    await runner._maybe_update_discord_thread_title(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名を直して",
+        assistant_response="対応します",
+        agent_messages=[],
+    )
+
+    assert recorded["timeout"] == 120.0
 
 
 @pytest.mark.asyncio

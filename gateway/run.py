@@ -50,6 +50,7 @@ from hermes_cli.config import cfg_get
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
+_DISCORD_THREAD_TITLE_TIMEOUT_SECONDS = 120.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
 
@@ -7070,7 +7071,7 @@ class GatewayRunner:
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
 
-            await self._maybe_update_discord_thread_title(
+            self._schedule_discord_thread_title_update(
                 source=source,
                 session_id=session_entry.session_id,
                 user_message=message_text,
@@ -7178,6 +7179,70 @@ class GatewayRunner:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
+    def _schedule_discord_thread_title_update(
+        self,
+        *,
+        source: SessionSource,
+        session_id: str,
+        user_message: str,
+        assistant_response: str,
+        agent_messages: list,
+        agent: Any = None,
+    ) -> Optional[asyncio.Task]:
+        """Schedule Discord thread title generation off the response path."""
+        if source.platform != Platform.DISCORD or not getattr(source, "thread_id", None):
+            return None
+
+        thread_id = str(source.thread_id)
+        task = asyncio.create_task(
+            self._maybe_update_discord_thread_title(
+                source=source,
+                session_id=session_id,
+                user_message=user_message,
+                assistant_response=assistant_response,
+                agent_messages=agent_messages,
+                agent=agent,
+            ),
+            name=f"discord-thread-title-update:{thread_id}",
+        )
+        background_tasks = getattr(self, "_background_tasks", None)
+        if background_tasks is None:
+            background_tasks = set()
+            self._background_tasks = background_tasks
+        background_tasks.add(task)
+
+        def _observe_title_task(done_task: asyncio.Task) -> None:
+            background_tasks.discard(done_task)
+            try:
+                exc = done_task.exception()
+            except asyncio.CancelledError:
+                logger.info(
+                    "Discord thread title background task cancelled: thread_id=%s session_id=%s",
+                    thread_id,
+                    session_id,
+                )
+                return
+            except Exception as task_error:
+                logger.info(
+                    "Discord thread title background task observation failed: thread_id=%s session_id=%s error=%s",
+                    thread_id,
+                    session_id,
+                    task_error,
+                    exc_info=True,
+                )
+                return
+            if exc is not None:
+                logger.info(
+                    "Discord thread title auto-update skipped: reason=task_exception thread_id=%s session_id=%s error=%s",
+                    thread_id,
+                    session_id,
+                    exc,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_observe_title_task)
+        return task
+
     async def _maybe_update_discord_thread_title(
         self,
         *,
@@ -7223,7 +7288,7 @@ class GatewayRunner:
                 generate_title,
                 user_message,
                 assistant_response,
-                60.0,
+                _DISCORD_THREAD_TITLE_TIMEOUT_SECONDS,
                 None,
                 None,
             )
