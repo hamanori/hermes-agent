@@ -51,7 +51,32 @@ _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _DISCORD_THREAD_TITLE_TIMEOUT_SECONDS = 120.0
+_DISCORD_THREAD_TITLE_LOW_INFORMATION = {
+    "相談",
+    "ニュース",
+    "discord整理",
+    "task",
+    "title",
+}
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+
+
+def _normalize_discord_thread_title_candidate(title: str) -> str:
+    """Return a compact comparison key for generated Discord thread titles."""
+    candidate = re.sub(r"[\r\n\t]+", " ", title or "")
+    candidate = re.sub(r"\s+", " ", candidate)
+    candidate = candidate.strip(" \"'`*_。.!?！？:：-—")
+    return candidate
+
+
+def _is_low_information_discord_thread_title(title: str) -> bool:
+    """Reject generated titles that are too generic to store or rename."""
+    candidate = _normalize_discord_thread_title_candidate(title)
+    if not candidate:
+        return True
+    if candidate.casefold() in _DISCORD_THREAD_TITLE_LOW_INFORMATION:
+        return True
+    return False
 
 
 def _telegramize_command_mentions(text: str, platform: Any) -> str:
@@ -7194,6 +7219,14 @@ class GatewayRunner:
             return None
 
         thread_id = str(source.thread_id)
+        title_generations = getattr(self, "_discord_thread_title_generations", None)
+        if title_generations is None:
+            title_generations = {}
+            self._discord_thread_title_generations = title_generations
+        title_key = (str(source.platform.value), thread_id, session_id or "")
+        title_generation = title_generations.get(title_key, 0) + 1
+        title_generations[title_key] = title_generation
+
         task = asyncio.create_task(
             self._maybe_update_discord_thread_title(
                 source=source,
@@ -7202,6 +7235,7 @@ class GatewayRunner:
                 assistant_response=assistant_response,
                 agent_messages=agent_messages,
                 agent=agent,
+                title_generation=title_generation,
             ),
             name=f"discord-thread-title-update:{thread_id}",
         )
@@ -7252,6 +7286,7 @@ class GatewayRunner:
         assistant_response: str,
         agent_messages: list,
         agent: Any = None,
+        title_generation: Optional[int] = None,
     ) -> None:
         """Best-effort update of a Discord thread name from the latest turn.
 
@@ -7264,6 +7299,14 @@ class GatewayRunner:
             if source.platform != Platform.DISCORD or not getattr(source, "thread_id", None):
                 return
             thread_id = str(source.thread_id)
+            title_key = (str(source.platform.value), thread_id, session_id or "")
+
+            def _is_stale_generation() -> bool:
+                if title_generation is None:
+                    return False
+                latest = getattr(self, "_discord_thread_title_generations", {}).get(title_key)
+                return latest != title_generation
+
             adapter = self.adapters.get(source.platform)
             if not adapter or not hasattr(adapter, "update_thread_title"):
                 logger.info(
@@ -7293,11 +7336,27 @@ class GatewayRunner:
                 None,
             )
             safe_title = (title or "")[:80]
+            if _is_stale_generation():
+                logger.info(
+                    "Discord thread title auto-update skipped: reason=stale_generation thread_id=%s session_id=%s generation=%s",
+                    thread_id,
+                    session_id,
+                    title_generation,
+                )
+                return
             if not title:
                 logger.info(
                     "Discord thread title auto-update skipped: reason=empty_generated_title media_policy=text_only_no_image_analysis thread_id=%s session_id=%s",
                     thread_id,
                     session_id,
+                )
+                return
+            if _is_low_information_discord_thread_title(title):
+                logger.info(
+                    "Discord thread title auto-update skipped: reason=low_information_generated_title thread_id=%s session_id=%s title=%r",
+                    thread_id,
+                    session_id,
+                    safe_title,
                 )
                 return
 
@@ -7310,6 +7369,14 @@ class GatewayRunner:
 
             # Keep the internal session title aligned too, but do not let DB
             # failures block the visible Discord rename.
+            if _is_stale_generation():
+                logger.info(
+                    "Discord thread title auto-update skipped: reason=stale_generation_before_apply thread_id=%s session_id=%s generation=%s",
+                    thread_id,
+                    session_id,
+                    title_generation,
+                )
+                return
             if getattr(self, "_session_db", None) and session_id:
                 try:
                     self._session_db.set_session_title(session_id, title)
@@ -7327,6 +7394,14 @@ class GatewayRunner:
                         db_error,
                     )
 
+            if _is_stale_generation():
+                logger.info(
+                    "Discord thread title auto-update skipped: reason=stale_generation_before_rename thread_id=%s session_id=%s generation=%s",
+                    thread_id,
+                    session_id,
+                    title_generation,
+                )
+                return
             renamed = await adapter.update_thread_title(thread_id, title, user_message=user_message)
             if not renamed:
                 logger.info(
