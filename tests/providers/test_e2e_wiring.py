@@ -116,3 +116,62 @@ class TestDeepSeekProfileWiring:
             ollama_num_ctx=None,
         )
         assert kwargs["messages"] == msgs
+
+
+class TestOpenCodeGoProfileWiring:
+    def test_multimodal_history_is_text_only_for_deepseek_routes(self, transport):
+        profile = get_provider_profile("opencode-go")
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "please inspect"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                ],
+            },
+            {"role": "assistant", "content": "ok"},
+        ]
+        kwargs = transport.build_kwargs(
+            model="deepseek-v4-pro",
+            messages=msgs,
+            tools=None,
+            provider_profile=profile,
+            max_tokens=None,
+            max_tokens_param_fn=lambda x: {"max_tokens": x} if x else {},
+            timeout=300,
+            reasoning_config=None,
+            request_overrides=None,
+            session_id="test",
+            ollama_num_ctx=None,
+        )
+
+        assert kwargs["messages"][0]["content"] == "please inspect\n[image omitted: https://example.com/a.png]"
+        assert msgs[0]["content"][1]["type"] == "image_url"
+
+    def test_opencode_zen_keeps_multimodal_history(self, transport):
+        profile = get_provider_profile("opencode-zen")
+        msgs = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "please inspect"},
+                    {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                ],
+            }
+        ]
+        kwargs = transport.build_kwargs(
+            model="gemini-3-flash",
+            messages=msgs,
+            tools=None,
+            provider_profile=profile,
+            max_tokens=None,
+            max_tokens_param_fn=lambda x: {"max_tokens": x} if x else {},
+            timeout=300,
+            reasoning_config=None,
+            request_overrides=None,
+            session_id="test",
+            ollama_num_ctx=None,
+        )
+
+        assert kwargs["messages"] is msgs
+        assert kwargs["messages"][0]["content"][1]["type"] == "image_url"

@@ -1016,6 +1016,30 @@ class TestRunJobSessionPersistence:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["enabled_toolsets"] == ["terminal"]
 
+    def test_run_job_empty_enabled_toolsets_is_explicit_toolless_override(self, tmp_path):
+        """An explicit empty per-job list means tool-less, not platform fallback."""
+        job = {
+            "id": "toolless-job",
+            "name": "test",
+            "prompt": "hello",
+            "enabled_toolsets": [],
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls, \
+             patch(
+                 "hermes_cli.tools_config._get_platform_tools",
+                 return_value={"web", "file"},
+             ) as mock_get_platform_tools:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["enabled_toolsets"] == []
+        mock_get_platform_tools.assert_not_called()
+
     def test_run_job_empty_response_returns_empty_not_placeholder(self, tmp_path):
         """Empty final_response should stay empty for delivery logic (issue #2234).
 

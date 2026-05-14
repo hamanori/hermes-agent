@@ -61,6 +61,7 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
 
     Precedence:
     1. Per-job ``enabled_toolsets`` (set via ``cronjob`` tool on create/update).
+       An explicit empty list means no tools, not fallback-to-default.
        Keeps the agent's job-scoped toolset override intact — #6130.
     2. Per-platform ``hermes tools`` config for the ``cron`` platform.
        Mirrors gateway behavior (``_get_platform_tools(cfg, platform_key)``)
@@ -73,9 +74,8 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     get cron WITHOUT ``moa`` by default (issue reported by Norbert —
     surprise $4.63 run).
     """
-    per_job = job.get("enabled_toolsets")
-    if per_job:
-        return per_job
+    if "enabled_toolsets" in job and job.get("enabled_toolsets") is not None:
+        return list(job.get("enabled_toolsets") or [])
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
         return sorted(_get_platform_tools(cfg or {}, "cron"))
