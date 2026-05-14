@@ -396,6 +396,44 @@ async def test_maybe_update_discord_thread_title_skips_when_generated_title_empt
 
 
 @pytest.mark.asyncio
+async def test_maybe_update_discord_thread_title_calls_adapter_when_title_generated(monkeypatch, caplog):
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(return_value=True))
+    session_db = MagicMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_db = session_db
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+    monkeypatch.setattr("agent.title_generator.generate_title", lambda *args, **kwargs: "Discordスレ名仕様")
+    caplog.set_level("INFO", logger=gateway_run.logger.name)
+
+    await runner._maybe_update_discord_thread_title(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名アルゴリズムを確認して",
+        assistant_response="スレ名更新の仕様を確認しました",
+        agent_messages=[],
+    )
+
+    session_db.set_session_title.assert_called_once_with("session-1", "Discordスレ名仕様")
+    adapter.update_thread_title.assert_awaited_once_with(
+        "777",
+        "Discordスレ名仕様",
+        user_message="Discordのスレ名アルゴリズムを確認して",
+    )
+    assert "Discord thread title auto-update generated" in caplog.text
+    assert "Discordスレ名仕様" in caplog.text
+    assert "reason=adapter_returned_false" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_maybe_update_discord_thread_title_logs_adapter_false(monkeypatch, caplog):
     from gateway.run import GatewayRunner
     import gateway.run as gateway_run
