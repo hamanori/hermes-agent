@@ -1040,6 +1040,105 @@ def _derive_forum_thread_name(message: str) -> str:
 # same channel on every send when the directory cache has no entry (e.g. fresh
 # install, or channel created after the last directory build).
 _DISCORD_CHANNEL_TYPE_PROBE_CACHE: Dict[str, bool] = {}
+_DISCORD_SEND_MAX_ATTEMPTS = 3
+_DISCORD_SEND_MAX_RETRY_DELAY_SECONDS = 30.0
+
+
+def _discord_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"true", "1", "yes", "on"}
+
+
+def _discord_allowed_mentions_payload() -> dict:
+    """Return REST ``allowed_mentions`` payload matching the Discord adapter defaults.
+
+    Direct send_message delivery bypasses discord.py's Bot client, so the
+    client-level ``AllowedMentions`` safety net does not apply. Keep the same
+    safe defaults here: deny @everyone/@here and role pings unless explicitly
+    opted in, while preserving normal user/reply pings.
+    """
+    parse = []
+    if _discord_bool_env("DISCORD_ALLOW_MENTION_EVERYONE", False):
+        parse.append("everyone")
+    if _discord_bool_env("DISCORD_ALLOW_MENTION_ROLES", False):
+        parse.append("roles")
+    if _discord_bool_env("DISCORD_ALLOW_MENTION_USERS", True):
+        parse.append("users")
+    return {
+        "parse": parse,
+        "replied_user": _discord_bool_env("DISCORD_ALLOW_MENTION_REPLIED_USER", True),
+    }
+
+
+def _discord_retry_delay_from_response(resp, body: str, attempt: int) -> float | None:
+    """Return a bounded retry delay for Discord 429 responses, else None."""
+    if getattr(resp, "status", None) != 429:
+        return None
+
+    retry_after = None
+    headers = getattr(resp, "headers", None)
+    if headers is not None:
+        try:
+            retry_after = headers.get("Retry-After") or headers.get("retry-after")
+        except Exception:
+            retry_after = None
+
+    if retry_after is None and body:
+        try:
+            payload = json.loads(body)
+            retry_after = payload.get("retry_after")
+        except Exception:
+            retry_after = None
+
+    try:
+        delay = float(retry_after)
+    except (TypeError, ValueError):
+        delay = float(2 ** attempt)
+    return min(max(delay, 0.0), _DISCORD_SEND_MAX_RETRY_DELAY_SECONDS)
+
+
+async def _discord_post_with_retry(
+    session,
+    url: str,
+    *,
+    headers: dict,
+    request_kwargs: dict,
+    json_payload: Optional[dict] = None,
+    data_factory=None,
+    error_prefix: str,
+):
+    """POST to Discord, retrying lightweight 429s.
+
+    ``data_factory`` is called for every attempt so multipart FormData and file
+    handles/bytes are fresh on retry; aiohttp FormData is intentionally not
+    reusable after a failed request.
+    """
+    for attempt in range(_DISCORD_SEND_MAX_ATTEMPTS):
+        kwargs = dict(request_kwargs)
+        if json_payload is not None:
+            kwargs["json"] = json_payload
+        if data_factory is not None:
+            kwargs["data"] = data_factory()
+
+        async with session.post(url, headers=headers, **kwargs) as resp:
+            if resp.status in {200, 201}:
+                return await resp.json()
+            body = await resp.text()
+            delay = _discord_retry_delay_from_response(resp, body, attempt)
+            if delay is not None and attempt < _DISCORD_SEND_MAX_ATTEMPTS - 1:
+                logger.warning(
+                    "Discord send hit 429 (attempt %d/%d), retrying in %.1fs",
+                    attempt + 1,
+                    _DISCORD_SEND_MAX_ATTEMPTS,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            return _error(f"{error_prefix} ({resp.status}): {body}")
+
+    return _error(f"{error_prefix}: retry attempts exhausted")
 
 
 def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
@@ -1080,6 +1179,7 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
         auth_headers = {"Authorization": f"Bot {token}"}
         json_headers = {**auth_headers, "Content-Type": "application/json"}
         media_files = media_files or []
+        allowed_mentions = _discord_allowed_mentions_payload()
         last_data = None
         warnings = []
 
@@ -1143,46 +1243,63 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
                             {"id": str(idx), "filename": os.path.basename(path)}
                             for idx, path in enumerate(valid_media)
                         ]
-                        starter_message = {"content": message, "attachments": attachments_meta}
+                        starter_message = {
+                            "content": message,
+                            "attachments": attachments_meta,
+                            "allowed_mentions": allowed_mentions,
+                        }
                         payload_json = json.dumps({"name": thread_name, "message": starter_message})
 
-                        form = aiohttp.FormData()
-                        form.add_field("payload_json", payload_json, content_type="application/json")
-
-                        # Buffer file bytes up front — aiohttp's FormData can
-                        # read lazily and we don't want handles closing under
-                        # it on retry.
+                        # Buffer file bytes up front and rebuild FormData on
+                        # every attempt — aiohttp FormData is single-use.
                         try:
-                            for idx, media_path in enumerate(valid_media):
+                            media_payloads = []
+                            for media_path in valid_media:
                                 with open(media_path, "rb") as fh:
+                                    media_payloads.append((media_path, fh.read()))
+
+                            def make_form():
+                                form = aiohttp.FormData()
+                                form.add_field("payload_json", payload_json, content_type="application/json")
+                                for idx, (media_path, content) in enumerate(media_payloads):
                                     form.add_field(
                                         f"files[{idx}]",
-                                        fh.read(),
+                                        content,
                                         filename=os.path.basename(media_path),
                                     )
-                            async with session.post(thread_url, headers=auth_headers, data=form, **_req_kw) as resp:
-                                if resp.status not in {200, 201}:
-                                    body = await resp.text()
-                                    return _error(f"Discord forum thread creation error ({resp.status}): {body}")
-                                data = await resp.json()
+                                return form
+
+                            data = await _discord_post_with_retry(
+                                session,
+                                thread_url,
+                                headers=auth_headers,
+                                request_kwargs=_req_kw,
+                                data_factory=make_form,
+                                error_prefix="Discord forum thread creation error",
+                            )
+                            if data.get("error"):
+                                return data
                         except Exception as e:
                             return _error(_sanitize_error_text(f"Discord forum thread upload failed: {e}"))
                     else:
                         # No media — simple JSON POST creates the thread with
                         # just the text starter.
-                        async with session.post(
+                        data = await _discord_post_with_retry(
+                            session,
                             thread_url,
                             headers=json_headers,
-                            json={
+                            request_kwargs=_req_kw,
+                            json_payload={
                                 "name": thread_name,
-                                "message": {"content": message},
+                                "message": {
+                                    "content": message,
+                                    "allowed_mentions": allowed_mentions,
+                                },
                             },
-                            **_req_kw,
-                        ) as resp:
-                            if resp.status not in {200, 201}:
-                                body = await resp.text()
-                                return _error(f"Discord forum thread creation error ({resp.status}): {body}")
-                            data = await resp.json()
+                            error_prefix="Discord forum thread creation error",
+                        )
+                        if data.get("error"):
+                            return data
 
                 thread_id_created = data.get("id")
                 starter_msg_id = (data.get("message") or {}).get("id", thread_id_created)
@@ -1202,11 +1319,16 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
-                    if resp.status not in {200, 201}:
-                        body = await resp.text()
-                        return _error(f"Discord API error ({resp.status}): {body}")
-                    last_data = await resp.json()
+                last_data = await _discord_post_with_retry(
+                    session,
+                    url,
+                    headers=json_headers,
+                    request_kwargs=_req_kw,
+                    json_payload={"content": message, "allowed_mentions": allowed_mentions},
+                    error_prefix="Discord API error",
+                )
+                if last_data.get("error"):
+                    return last_data
 
             # Send each media file as a separate multipart upload
             for media_path, _is_voice in media_files:
@@ -1216,18 +1338,29 @@ async def _send_discord(token, chat_id, message, thread_id=None, media_files=Non
                     warnings.append(warning)
                     continue
                 try:
-                    form = aiohttp.FormData()
                     filename = os.path.basename(media_path)
                     with open(media_path, "rb") as f:
-                        form.add_field("files[0]", f, filename=filename)
-                        async with session.post(url, headers=auth_headers, data=form, **_req_kw) as resp:
-                            if resp.status not in {200, 201}:
-                                body = await resp.text()
-                                warning = _sanitize_error_text(f"Failed to send media {media_path}: Discord API error ({resp.status}): {body}")
-                                logger.error(warning)
-                                warnings.append(warning)
-                                continue
-                            last_data = await resp.json()
+                        media_bytes = f.read()
+
+                    def make_form():
+                        form = aiohttp.FormData()
+                        form.add_field("files[0]", media_bytes, filename=filename)
+                        return form
+
+                    media_data = await _discord_post_with_retry(
+                        session,
+                        url,
+                        headers=auth_headers,
+                        request_kwargs=_req_kw,
+                        data_factory=make_form,
+                        error_prefix="Discord API error",
+                    )
+                    if media_data.get("error"):
+                        warning = _sanitize_error_text(f"Failed to send media {media_path}: {media_data['error']}")
+                        logger.error(warning)
+                        warnings.append(warning)
+                        continue
+                    last_data = media_data
                 except Exception as e:
                     warning = _sanitize_error_text(f"Failed to send media {media_path}: {e}")
                     logger.error(warning)
