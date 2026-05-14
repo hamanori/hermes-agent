@@ -54,7 +54,15 @@ def _text_from_openai_parts(parts: list[Any]) -> str:
 class OpenCodeGoProfile(ProviderProfile):
     """OpenCode Go — text-only fallback for DeepSeek-compatible routes."""
 
-    def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def prepare_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if "deepseek" not in (model or "").lower():
+            return messages
+
         needs_text_only = any(
             isinstance(msg, dict)
             and isinstance(msg.get("content"), list)

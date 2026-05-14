@@ -10,7 +10,12 @@ from providers.base import ProviderProfile
 class QwenProfile(ProviderProfile):
     """Qwen Portal — message normalization, vl_high_resolution, metadata top-level."""
 
-    def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def prepare_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Normalize content to list-of-dicts format.
 
         Inject cache_control on system message.

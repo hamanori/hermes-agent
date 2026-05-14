@@ -403,6 +403,54 @@ async def test_schedule_discord_thread_title_update_returns_without_waiting(monk
 
 
 @pytest.mark.asyncio
+async def test_schedule_discord_thread_title_update_uses_gateway_loop_from_worker_thread(monkeypatch):
+    from gateway.run import GatewayRunner
+    import threading
+
+    started = asyncio.Event()
+    runner = object.__new__(GatewayRunner)
+    runner._background_tasks = set()
+    runner._gateway_loop = asyncio.get_running_loop()
+
+    async def fast_update(**kwargs):
+        started.set()
+
+    monkeypatch.setattr(runner, "_maybe_update_discord_thread_title", fast_update)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+    scheduled = []
+    errors = []
+
+    def schedule_from_worker_thread():
+        try:
+            scheduled.append(
+                runner._schedule_discord_thread_title_update(
+                    source=source,
+                    session_id="session-1",
+                    user_message="Discordのスレ名を直して",
+                    assistant_response="対応します",
+                    agent_messages=[],
+                )
+            )
+        except Exception as exc:  # pragma: no cover - assertion handles this
+            errors.append(exc)
+
+    thread = threading.Thread(target=schedule_from_worker_thread)
+    thread.start()
+    thread.join(timeout=1)
+
+    assert errors == []
+    assert scheduled and scheduled[0] is not None
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wrap_future(scheduled[0])
+    assert scheduled[0] not in runner._background_tasks
+
+
+@pytest.mark.asyncio
 async def test_schedule_discord_thread_title_update_observes_task_exception(monkeypatch, caplog):
     from gateway.run import GatewayRunner
     import gateway.run as gateway_run
