@@ -7225,8 +7225,13 @@ class GatewayRunner:
             title_tasks = {}
             self._discord_thread_title_tasks = title_tasks
 
+        applying_tasks = getattr(self, "_discord_thread_title_applying_tasks", None)
+        if applying_tasks is None:
+            applying_tasks = set()
+            self._discord_thread_title_applying_tasks = applying_tasks
+
         existing_task = title_tasks.get(title_key)
-        if existing_task is not None and not existing_task.done():
+        if existing_task is not None and not existing_task.done() and existing_task not in applying_tasks:
             existing_task.cancel()
 
         task = asyncio.create_task(
@@ -7381,24 +7386,32 @@ class GatewayRunner:
 
             # Serialize the visible rename apply section so two live HTTP
             # renames for the same Discord thread cannot complete out of order.
-            # Recheck the latest task both before waiting for the lock and while
-            # holding it because asyncio.to_thread cancellation does not stop
-            # the worker thread immediately.
+            # Recheck the latest task before committing to the apply queue so
+            # stale generation results are dropped, then avoid cancelling/skipping
+            # tasks that already entered the serialized apply section.
             if _is_stale_task():
                 _log_stale_task("stale_task_before_rename")
                 return
-            async with title_apply_lock:
-                if _is_stale_task():
-                    _log_stale_task("stale_task_before_rename_locked")
-                    return
-                renamed = await adapter.update_thread_title(thread_id, title, user_message=user_message)
-                if not renamed:
-                    logger.info(
-                        "Discord thread title auto-update skipped: reason=adapter_returned_false thread_id=%s session_id=%s title=%r",
-                        thread_id,
-                        session_id,
-                        safe_title,
-                    )
+            applying_tasks = getattr(self, "_discord_thread_title_applying_tasks", None)
+            if applying_tasks is None:
+                applying_tasks = set()
+                self._discord_thread_title_applying_tasks = applying_tasks
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                applying_tasks.add(current_task)
+            try:
+                async with title_apply_lock:
+                    renamed = await adapter.update_thread_title(thread_id, title, user_message=user_message)
+                    if not renamed:
+                        logger.info(
+                            "Discord thread title auto-update skipped: reason=adapter_returned_false thread_id=%s session_id=%s title=%r",
+                            thread_id,
+                            session_id,
+                            safe_title,
+                        )
+            finally:
+                if current_task is not None:
+                    applying_tasks.discard(current_task)
         except Exception as e:
             logger.info("Discord thread title auto-update skipped: reason=exception error=%s", e, exc_info=True)
     def _format_session_info(self) -> str:

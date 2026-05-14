@@ -600,12 +600,13 @@ async def test_schedule_discord_thread_title_update_ignores_stale_completion(mon
 
 
 @pytest.mark.asyncio
-async def test_schedule_discord_thread_title_update_cancels_in_flight_rename(monkeypatch):
+async def test_schedule_discord_thread_title_update_serializes_in_flight_renames(monkeypatch):
     from gateway.run import GatewayRunner
 
     calls = []
     first_rename_started = asyncio.Event()
-    second_rename_finished = asyncio.Event()
+    first_rename_finished = asyncio.Event()
+    second_rename_started = asyncio.Event()
     release_first_rename = asyncio.Event()
 
     async def update_thread_title(_thread_id, title, *, user_message):
@@ -613,9 +614,12 @@ async def test_schedule_discord_thread_title_update_cancels_in_flight_rename(mon
         if title == "First Turn Title":
             first_rename_started.set()
             await release_first_rename.wait()
-        calls.append(("finish", title))
         if title == "Second Turn Title":
-            second_rename_finished.set()
+            second_rename_started.set()
+            assert first_rename_finished.is_set(), "newer rename started while an older rename was still in flight"
+        calls.append(("finish", title))
+        if title == "First Turn Title":
+            first_rename_finished.set()
         return True
 
     adapter = SimpleNamespace(update_thread_title=AsyncMock(side_effect=update_thread_title))
@@ -654,15 +658,16 @@ async def test_schedule_discord_thread_title_update_cancels_in_flight_rename(mon
         assistant_response="second response",
         agent_messages=[],
     )
-    await asyncio.wait_for(second_rename_finished.wait(), timeout=1)
 
+    await asyncio.sleep(0)
+    assert not second_rename_started.is_set()
     release_first_rename.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(first_task, timeout=1)
+    await asyncio.wait_for(first_task, timeout=1)
     await asyncio.wait_for(second_task, timeout=1)
 
     assert calls == [
         ("start", "First Turn Title"),
+        ("finish", "First Turn Title"),
         ("start", "Second Turn Title"),
         ("finish", "Second Turn Title"),
     ]
