@@ -92,7 +92,12 @@ class ProviderProfile:
             return urlparse(self.base_url).hostname or ""
         return ""
 
-    def prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def prepare_messages(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        model: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Provider-specific message preprocessing.
 
         Called AFTER codex field sanitization, BEFORE developer role swap.

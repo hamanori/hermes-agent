@@ -399,7 +399,7 @@ class ChatCompletionsTransport(ProviderTransport):
         from providers.base import OMIT_TEMPERATURE
 
         # Message preprocessing
-        sanitized = profile.prepare_messages(sanitized)
+        sanitized = profile.prepare_messages(sanitized, model=model)
 
         # Developer role swap — model-name-based, applies to all providers
         _model_lower = (model or "").lower()
