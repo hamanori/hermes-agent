@@ -7300,6 +7300,11 @@ class GatewayRunner:
                 return
             thread_id = str(source.thread_id)
             title_key = (str(source.platform.value), thread_id, session_id or "")
+            title_apply_locks = getattr(self, "_discord_thread_title_apply_locks", None)
+            if title_apply_locks is None:
+                title_apply_locks = {}
+                self._discord_thread_title_apply_locks = title_apply_locks
+            title_apply_lock = title_apply_locks.setdefault(title_key, asyncio.Lock())
 
             def _is_stale_generation() -> bool:
                 if title_generation is None:
@@ -7368,48 +7373,51 @@ class GatewayRunner:
             )
 
             # Keep the internal session title aligned too, but do not let DB
-            # failures block the visible Discord rename.
-            if _is_stale_generation():
-                logger.info(
-                    "Discord thread title auto-update skipped: reason=stale_generation_before_apply thread_id=%s session_id=%s generation=%s",
-                    thread_id,
-                    session_id,
-                    title_generation,
-                )
-                return
-            if getattr(self, "_session_db", None) and session_id:
-                try:
-                    self._session_db.set_session_title(session_id, title)
+            # failures block the visible Discord rename.  Serialize the apply
+            # section so an older in-flight HTTP rename cannot finish after a
+            # newer rename for the same Discord thread/session key.
+            async with title_apply_lock:
+                if _is_stale_generation():
                     logger.info(
-                        "Discord thread title auto-update stored session title: thread_id=%s session_id=%s title=%r",
+                        "Discord thread title auto-update skipped: reason=stale_generation_before_apply thread_id=%s session_id=%s generation=%s",
+                        thread_id,
+                        session_id,
+                        title_generation,
+                    )
+                    return
+                if getattr(self, "_session_db", None) and session_id:
+                    try:
+                        self._session_db.set_session_title(session_id, title)
+                        logger.info(
+                            "Discord thread title auto-update stored session title: thread_id=%s session_id=%s title=%r",
+                            thread_id,
+                            session_id,
+                            safe_title,
+                        )
+                    except Exception as db_error:
+                        logger.info(
+                            "Discord thread title auto-update skipped DB title store: reason=db_set_failed thread_id=%s session_id=%s error=%s",
+                            thread_id,
+                            session_id,
+                            db_error,
+                        )
+
+                if _is_stale_generation():
+                    logger.info(
+                        "Discord thread title auto-update skipped: reason=stale_generation_before_rename thread_id=%s session_id=%s generation=%s",
+                        thread_id,
+                        session_id,
+                        title_generation,
+                    )
+                    return
+                renamed = await adapter.update_thread_title(thread_id, title, user_message=user_message)
+                if not renamed:
+                    logger.info(
+                        "Discord thread title auto-update skipped: reason=adapter_returned_false thread_id=%s session_id=%s title=%r",
                         thread_id,
                         session_id,
                         safe_title,
                     )
-                except Exception as db_error:
-                    logger.info(
-                        "Discord thread title auto-update skipped DB title store: reason=db_set_failed thread_id=%s session_id=%s error=%s",
-                        thread_id,
-                        session_id,
-                        db_error,
-                    )
-
-            if _is_stale_generation():
-                logger.info(
-                    "Discord thread title auto-update skipped: reason=stale_generation_before_rename thread_id=%s session_id=%s generation=%s",
-                    thread_id,
-                    session_id,
-                    title_generation,
-                )
-                return
-            renamed = await adapter.update_thread_title(thread_id, title, user_message=user_message)
-            if not renamed:
-                logger.info(
-                    "Discord thread title auto-update skipped: reason=adapter_returned_false thread_id=%s session_id=%s title=%r",
-                    thread_id,
-                    session_id,
-                    safe_title,
-                )
         except Exception as e:
             logger.info("Discord thread title auto-update skipped: reason=exception error=%s", e, exc_info=True)
     def _format_session_info(self) -> str:
