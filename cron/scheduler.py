@@ -659,10 +659,59 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 adapter_ok = True
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
-                    future = safe_schedule_threadsafe(
-                        runtime_adapter.send(chat_id, text_to_send, metadata=send_metadata),
-                        loop,
-                    )
+
+                    if platform_name.lower() == "discord":
+                        from gateway.markdown_table_images import segment_markdown_tables
+
+                        table_segments = segment_markdown_tables(text_to_send)
+                        table_segments_changed = (
+                            len(table_segments) != 1
+                            or (table_segments and table_segments[0].content != text_to_send)
+                        )
+                        if table_segments_changed:
+                            for segment in table_segments:
+                                if segment.kind == "image":
+                                    future = safe_schedule_threadsafe(
+                                        runtime_adapter.send_image_file(
+                                            chat_id=chat_id,
+                                            image_path=segment.content,
+                                            metadata=send_metadata,
+                                        ),
+                                        loop,
+                                    )
+                                else:
+                                    if not segment.content.strip():
+                                        continue
+                                    future = safe_schedule_threadsafe(
+                                        runtime_adapter.send(chat_id, segment.content, metadata=send_metadata),
+                                        loop,
+                                    )
+                                if future is None:
+                                    adapter_ok = False
+                                    break
+                                try:
+                                    send_result = future.result(timeout=60)
+                                except TimeoutError:
+                                    future.cancel()
+                                    raise
+                                if send_result and not getattr(send_result, "success", True):
+                                    err = getattr(send_result, "error", "unknown")
+                                    logger.warning(
+                                        "Job '%s': live adapter Discord table send to %s:%s failed (%s), falling back to standalone",
+                                        job["id"], platform_name, chat_id, err,
+                                    )
+                                    adapter_ok = False
+                                    break
+                        else:
+                            future = safe_schedule_threadsafe(
+                                runtime_adapter.send(chat_id, text_to_send, metadata=send_metadata),
+                                loop,
+                            )
+                    else:
+                        future = safe_schedule_threadsafe(
+                            runtime_adapter.send(chat_id, text_to_send, metadata=send_metadata),
+                            loop,
+                        )
                     if future is None:
                         adapter_ok = False
                     else:
