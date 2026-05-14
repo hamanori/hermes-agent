@@ -4,6 +4,7 @@ Tests the _handle_title_command handler (set/show session titles)
 across all gateway messenger platforms.
 """
 
+import asyncio
 import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -356,3 +357,385 @@ class TestNewInHelp:
         new_line = next((line for line in lines if line.startswith("`/new ")), None)
         assert new_line is not None
         assert "[name]" in new_line
+
+
+# ---------------------------------------------------------------------------
+# Discord thread auto-title observation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_schedule_discord_thread_title_update_returns_without_waiting(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    runner = object.__new__(GatewayRunner)
+    runner._background_tasks = set()
+
+    async def slow_update(**kwargs):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(runner, "_maybe_update_discord_thread_title", slow_update)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+
+    task = runner._schedule_discord_thread_title_update(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名を直して",
+        assistant_response="対応します",
+        agent_messages=[],
+    )
+
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert task is not None
+    assert not task.done()
+    assert task in runner._background_tasks
+    release.set()
+    await asyncio.wait_for(task, timeout=1)
+    assert task not in runner._background_tasks
+
+
+@pytest.mark.asyncio
+async def test_schedule_discord_thread_title_update_observes_task_exception(monkeypatch, caplog):
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+
+    runner = object.__new__(GatewayRunner)
+    runner._background_tasks = set()
+
+    async def failing_update(**kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(runner, "_maybe_update_discord_thread_title", failing_update)
+    caplog.set_level("INFO", logger=gateway_run.logger.name)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+
+    task = runner._schedule_discord_thread_title_update(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名を直して",
+        assistant_response="対応します",
+        agent_messages=[],
+    )
+
+    try:
+        await asyncio.wait_for(task, timeout=1)
+    except RuntimeError:
+        pass
+    await asyncio.sleep(0)
+    assert "reason=task_exception" in caplog.text
+    assert "thread_id=777" in caplog.text
+    assert "session_id=session-1" in caplog.text
+    assert "boom" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_discord_thread_title_uses_long_background_timeout(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(return_value=True))
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_db = None
+    recorded = {}
+
+    def fake_generate_title(*args, **kwargs):
+        recorded["timeout"] = args[2]
+        return "Discordスレ名仕様"
+
+    monkeypatch.setattr("agent.title_generator.generate_title", fake_generate_title)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+
+    await runner._maybe_update_discord_thread_title(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名を直して",
+        assistant_response="対応します",
+        agent_messages=[],
+    )
+
+    assert recorded["timeout"] == 120.0
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_discord_thread_title_skips_when_generated_title_empty(monkeypatch, caplog):
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(return_value=True))
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_db = None
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+    monkeypatch.setattr("agent.title_generator.generate_title", lambda *args, **kwargs: "")
+    caplog.set_level("INFO", logger=gateway_run.logger.name)
+
+    await runner._maybe_update_discord_thread_title(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名を直して",
+        assistant_response="対応します",
+        agent_messages=[],
+    )
+
+    assert "reason=empty_generated_title" in caplog.text
+    assert "media_policy=text_only_no_image_analysis" in caplog.text
+    assert "thread_id=777" in caplog.text
+    adapter.update_thread_title.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_discord_thread_title_skips_low_information_generated_title(monkeypatch, caplog):
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(return_value=True))
+    session_db = MagicMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_db = session_db
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+    monkeypatch.setattr("agent.title_generator.generate_title", lambda *args, **kwargs: "相談")
+    caplog.set_level("INFO", logger=gateway_run.logger.name)
+
+    await runner._maybe_update_discord_thread_title(
+        source=source,
+        session_id="session-1",
+        user_message="相談したい",
+        assistant_response="どうしましたか？",
+        agent_messages=[],
+    )
+
+    session_db.set_session_title.assert_not_called()
+    adapter.update_thread_title.assert_not_awaited()
+    assert "reason=low_information_generated_title" in caplog.text
+    assert "thread_id=777" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_schedule_discord_thread_title_update_ignores_stale_completion(monkeypatch):
+    from gateway.run import GatewayRunner
+    import threading
+
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(return_value=True))
+    session_db = MagicMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_db = session_db
+    runner._background_tasks = set()
+    first_started = threading.Event()
+    release_first = threading.Event()
+
+    def fake_generate_title(user_message, *_args, **_kwargs):
+        if user_message == "first turn":
+            first_started.set()
+            assert release_first.wait(timeout=2), "timed out waiting to release first title"
+            return "First Turn Title"
+        return "Second Turn Title"
+
+    monkeypatch.setattr("agent.title_generator.generate_title", fake_generate_title)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+
+    first_task = runner._schedule_discord_thread_title_update(
+        source=source,
+        session_id="session-1",
+        user_message="first turn",
+        assistant_response="first response",
+        agent_messages=[],
+    )
+    await asyncio.wait_for(asyncio.to_thread(first_started.wait, 1), timeout=1)
+
+    second_task = runner._schedule_discord_thread_title_update(
+        source=source,
+        session_id="session-1",
+        user_message="second turn",
+        assistant_response="second response",
+        agent_messages=[],
+    )
+    await asyncio.wait_for(second_task, timeout=1)
+    release_first.set()
+    await asyncio.wait_for(first_task, timeout=1)
+
+    session_db.set_session_title.assert_called_once_with("session-1", "Second Turn Title")
+    adapter.update_thread_title.assert_awaited_once_with(
+        "777",
+        "Second Turn Title",
+        user_message="second turn",
+    )
+
+
+@pytest.mark.asyncio
+async def test_schedule_discord_thread_title_update_serializes_in_flight_renames(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    calls = []
+    first_rename_started = asyncio.Event()
+    second_rename_finished = asyncio.Event()
+    release_first_rename = asyncio.Event()
+
+    async def update_thread_title(_thread_id, title, *, user_message):
+        calls.append(("start", title))
+        if title == "First Turn Title":
+            first_rename_started.set()
+            await release_first_rename.wait()
+        calls.append(("finish", title))
+        if title == "Second Turn Title":
+            second_rename_finished.set()
+        return True
+
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(side_effect=update_thread_title))
+    session_db = MagicMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_db = session_db
+    runner._background_tasks = set()
+
+    def fake_generate_title(user_message, *_args, **_kwargs):
+        if user_message == "first turn":
+            return "First Turn Title"
+        return "Second Turn Title"
+
+    monkeypatch.setattr("agent.title_generator.generate_title", fake_generate_title)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+
+    first_task = runner._schedule_discord_thread_title_update(
+        source=source,
+        session_id="session-1",
+        user_message="first turn",
+        assistant_response="first response",
+        agent_messages=[],
+    )
+    await asyncio.wait_for(first_rename_started.wait(), timeout=1)
+
+    second_task = runner._schedule_discord_thread_title_update(
+        source=source,
+        session_id="session-1",
+        user_message="second turn",
+        assistant_response="second response",
+        agent_messages=[],
+    )
+    try:
+        await asyncio.wait_for(second_rename_finished.wait(), timeout=0.2)
+    except asyncio.TimeoutError:
+        pass
+    else:
+        pytest.fail("newer rename finished while an older rename was still in flight")
+
+    release_first_rename.set()
+    await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=1)
+
+    assert calls == [
+        ("start", "First Turn Title"),
+        ("finish", "First Turn Title"),
+        ("start", "Second Turn Title"),
+        ("finish", "Second Turn Title"),
+    ]
+    assert session_db.set_session_title.call_args_list[-1].args == ("session-1", "Second Turn Title")
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_discord_thread_title_calls_adapter_when_title_generated(monkeypatch, caplog):
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(return_value=True))
+    session_db = MagicMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_db = session_db
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+    monkeypatch.setattr("agent.title_generator.generate_title", lambda *args, **kwargs: "Discordスレ名仕様")
+    caplog.set_level("INFO", logger=gateway_run.logger.name)
+
+    await runner._maybe_update_discord_thread_title(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名アルゴリズムを確認して",
+        assistant_response="スレ名更新の仕様を確認しました",
+        agent_messages=[],
+    )
+
+    session_db.set_session_title.assert_called_once_with("session-1", "Discordスレ名仕様")
+    adapter.update_thread_title.assert_awaited_once_with(
+        "777",
+        "Discordスレ名仕様",
+        user_message="Discordのスレ名アルゴリズムを確認して",
+    )
+    assert "Discord thread title auto-update generated" in caplog.text
+    assert "Discordスレ名仕様" in caplog.text
+    assert "reason=adapter_returned_false" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_discord_thread_title_logs_adapter_false(monkeypatch, caplog):
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(return_value=False))
+    session_db = MagicMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_db = session_db
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="parent",
+        chat_type="thread",
+        thread_id="777",
+    )
+    monkeypatch.setattr("agent.title_generator.generate_title", lambda *args, **kwargs: "Discordスレ名更新")
+    caplog.set_level("INFO", logger=gateway_run.logger.name)
+
+    await runner._maybe_update_discord_thread_title(
+        source=source,
+        session_id="session-1",
+        user_message="Discordのスレ名を直して",
+        assistant_response="対応します",
+        agent_messages=[],
+    )
+
+    session_db.set_session_title.assert_called_once_with("session-1", "Discordスレ名更新")
+    adapter.update_thread_title.assert_awaited_once_with("777", "Discordスレ名更新", user_message="Discordのスレ名を直して")
+    assert "reason=adapter_returned_false" in caplog.text
+    assert "title='Discordスレ名更新'" in caplog.text
