@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import concurrent.futures
 import dataclasses
 import inspect
 import json
@@ -8868,7 +8869,7 @@ class GatewayRunner:
         assistant_response: str,
         agent_messages: list,
         agent: Any = None,
-    ) -> Optional[asyncio.Task]:
+    ):
         """Schedule Discord thread title generation off the response path."""
         if source.platform != Platform.DISCORD or not getattr(source, "thread_id", None):
             return None
@@ -8882,18 +8883,35 @@ class GatewayRunner:
         title_generation = title_generations.get(title_key, 0) + 1
         title_generations[title_key] = title_generation
 
-        task = asyncio.create_task(
-            self._maybe_update_discord_thread_title(
-                source=source,
-                session_id=session_id,
-                user_message=user_message,
-                assistant_response=assistant_response,
-                agent_messages=agent_messages,
-                agent=agent,
-                title_generation=title_generation,
-            ),
-            name=f"discord-thread-title-update:{thread_id}",
+        try:
+            running_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = None
+        loop = running_loop or getattr(self, "_gateway_loop", None)
+        if loop is None or loop.is_closed():
+            logger.info(
+                "Discord thread title auto-update skipped: reason=loop_missing thread_id=%s session_id=%s",
+                thread_id,
+                session_id,
+            )
+            return None
+
+        coro = self._maybe_update_discord_thread_title(
+            source=source,
+            session_id=session_id,
+            user_message=user_message,
+            assistant_response=assistant_response,
+            agent_messages=agent_messages,
+            agent=agent,
+            title_generation=title_generation,
         )
+        if running_loop is loop:
+            task = loop.create_task(
+                coro,
+                name=f"discord-thread-title-update:{thread_id}",
+            )
+        else:
+            task = asyncio.run_coroutine_threadsafe(coro, loop)
         background_tasks = getattr(self, "_background_tasks", None)
         if background_tasks is None:
             background_tasks = set()
@@ -8904,7 +8922,7 @@ class GatewayRunner:
             background_tasks.discard(done_task)
             try:
                 exc = done_task.exception()
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, concurrent.futures.CancelledError):
                 logger.info(
                     "Discord thread title background task cancelled: thread_id=%s session_id=%s",
                     thread_id,
