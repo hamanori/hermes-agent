@@ -7223,7 +7223,7 @@ class GatewayRunner:
                 generate_title,
                 user_message,
                 assistant_response,
-                20.0,
+                60.0,
                 None,
                 None,
             )

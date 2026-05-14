@@ -20,7 +20,12 @@ FailureCallback = Callable[[str, BaseException], None]
 TitleCallback = Callable[[str], None]
 
 _TITLE_CONTEXT_CHARS = 1500
-_TITLE_MAX_TOKENS = 64
+# Reasoning-capable auxiliary models may spend much of the completion budget
+# on hidden/explicit reasoning before emitting the short visible title. 64 tokens
+# caused deepseek-v4-flash to finish with reasoning_content only and empty
+# message.content in production, which made Discord dynamic thread titles skip
+# forever. Keep enough headroom for the final title text.
+_TITLE_MAX_TOKENS = 4096
 
 
 def _recent_snippet(text: str, limit: int = _TITLE_CONTEXT_CHARS) -> str:

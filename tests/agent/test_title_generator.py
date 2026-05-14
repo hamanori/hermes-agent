@@ -119,7 +119,7 @@ class TestGenerateTitle:
         assert "VERY OLD ASSISTANT CONTEXT" not in user_content
         assert len(user_content) < 3200  # 1500 + 1500 + formatting
 
-    def test_title_generation_uses_small_output_budget(self):
+    def test_title_generation_uses_enough_output_budget_for_reasoning_models(self):
         captured_kwargs = {}
 
         def mock_call_llm(**kwargs):
@@ -132,7 +132,7 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
             generate_title("question", "answer")
 
-        assert captured_kwargs["max_tokens"] == 64
+        assert captured_kwargs["max_tokens"] == 4096
 
 
 class TestAutoTitleSession:
