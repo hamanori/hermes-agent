@@ -3868,6 +3868,149 @@ class DiscordAdapter(BasePlatformAdapter):
     # Auto-thread helpers
     # ------------------------------------------------------------------
 
+    def _derive_auto_thread_name(self, content: str) -> str:
+        """Derive a compact, glanceable Discord auto-thread title."""
+        text = (content or "").strip()
+        text = re.sub(r"<@[!&]?\d+>", "", text)
+        text = re.sub(r"<#\d+>", "", text)
+        text = re.sub(r"https?://\S+", "URL", text)
+        text = re.sub(r"\s+", " ", text).strip(" -—:：。.!?？")
+        if not text:
+            return "相談"
+
+        lower = text.lower()
+        buckets = [
+            ("Discord整理", ("discord", "スレ", "スレッド", "チャンネル", "thread")),
+            ("GitHub整理", ("github", "issue", "pull request", "pr", "リポジトリ")),
+            ("Hermes設定", ("hermes", "gateway", "cron", "config", "設定", "自動化")),
+            ("レシピ", ("レシピ", "料理", "献立", "食材")),
+            ("旅行", ("旅行", "宿", "ホテル", "交通", "おでかけ", "観光")),
+            ("YouTube", ("youtube", "動画", "視聴", "チャンネル")),
+            ("ニュース", ("ニュース", "記事", "調べ", "調査", "リサーチ")),
+            ("タスク整理", ("todo", "タスク", "やること", "予定", "リマインド")),
+            ("コード作業", ("コード", "実装", "修正", "バグ", "エラー", "テスト")),
+        ]
+        prefix = next((label for label, keys in buckets if any(k in lower for k in keys)), "相談")
+
+        snippet = re.sub(
+            r"^(ちょっと|なんか|えっと|あの|全体的に|念のため|できれば|可能なら|お願い|すみません|ごめん)[、,\s]*",
+            "",
+            text,
+        ).strip(" -—:：。.!?？")
+        snippet = re.split(r"[、,。！？!?\n]", snippet, maxsplit=1)[0]
+        if len(snippet) > 22:
+            snippet = snippet[:21].rstrip() + "…"
+
+        if not snippet or snippet == prefix:
+            return prefix
+        name = f"{prefix}: {snippet}"
+        return name[:80]
+
+    def _sanitize_thread_title(self, title: str) -> str:
+        """Normalize an LLM/session title into a Discord thread name."""
+        name = (title or "").strip()
+        name = re.sub(r"[\r\n\t]+", " ", name)
+        name = re.sub(r"\s+", " ", name)
+        name = name.strip(" \"'`*_。.!?！？:：-—")
+        name = re.sub(r"^(相談|ニュース|Discord整理|Hermes設定|タスク整理)[:：\s-]+", "", name).strip()
+        if self._looks_like_bad_thread_title(name):
+            name = self._compact_bad_thread_title(name)
+        if not name:
+            name = "相談"
+        if len(name) > 48:
+            name = name[:47].rstrip() + "…"
+        return name
+
+    def _looks_like_bad_thread_title(self, name: str) -> bool:
+        """Detect titles that are really answer snippets or markdown outlines."""
+        if not name:
+            return False
+        bad_markers = ("以下に示します", "##", "**", "```", "\n", "1.", "要点", "整理案")
+        return len(name) > 24 and any(marker in name for marker in bad_markers)
+
+    def _compact_bad_thread_title(self, name: str) -> str:
+        """Turn common verbose generated titles into glanceable sidebar labels."""
+        compact = name
+        replacements = (
+            (r"スレッド内容の?整理案.*", "スレッド内容整理"),
+            (r".*Discord.*スレ.*名.*", "Discordスレ名仕様"),
+            (r".*Hermes.*(?:設定|運用|自動化).*", "Hermes運用整理"),
+        )
+        for pattern, replacement in replacements:
+            if re.search(pattern, compact, flags=re.IGNORECASE):
+                return replacement
+        compact = re.split(r"[。.!?！？#*`\n]", compact, maxsplit=1)[0]
+        compact = compact.replace("以下に示します", "").replace("整理案", "整理")
+        return compact[:24].strip(" \"'`*_。.!?！？:：-—")
+
+    def _fallback_thread_title_from_user_message(self, user_message: str) -> str:
+        """Derive a compact fallback when LLM title generation is empty or unusable."""
+        text = (user_message or "").strip()
+        lower = text.lower()
+        if "discord" in lower and ("スレ" in text or "thread" in lower) and "名" in text:
+            return "Discordスレ名仕様"
+        if "hermes" in lower and ("設定" in text or "運用" in text):
+            return "Hermes運用整理"
+        title = self._derive_auto_thread_name(text)
+        return self._sanitize_thread_title(title)
+
+    async def update_thread_title(self, thread_id: str, title: str, user_message: str = "") -> bool:
+        """Best-effort rename of a Discord thread from a generated conversation title."""
+        if not self._client:
+            logger.info("[%s] Discord thread title update skipped: reason=no_client thread_id=%r", self.name, thread_id)
+            return False
+        if not thread_id:
+            logger.info("[%s] Discord thread title update skipped: reason=missing_thread_id", self.name)
+            return False
+        if not title and not user_message:
+            logger.info("[%s] Discord thread title update skipped: reason=no_title_or_user_message thread_id=%s", self.name, thread_id)
+            return False
+
+        if not title:
+            logger.info("[%s] Discord thread title update skipped: reason=no_generated_title thread_id=%s", self.name, thread_id)
+            return False
+
+        new_name = self._sanitize_thread_title(title)
+        if self._looks_like_bad_thread_title(new_name) or "…" in new_name or "どんな感じ" in new_name:
+            logger.info(
+                "[%s] Discord thread title candidate rejected: reason=bad_generated_title thread_id=%s candidate=%r",
+                self.name,
+                thread_id,
+                new_name,
+            )
+            return False
+
+        try:
+            thread = self._client.get_channel(int(thread_id))
+            if not thread:
+                thread = await self._client.fetch_channel(int(thread_id))
+            if not thread:
+                logger.info("[%s] Discord thread title update skipped: reason=fetch_channel_not_found thread_id=%s", self.name, thread_id)
+                return False
+            if not isinstance(thread, discord.Thread):
+                logger.info(
+                    "[%s] Discord thread title update skipped: reason=fetched_non_thread thread_id=%s fetched_type=%s",
+                    self.name,
+                    thread_id,
+                    type(thread).__name__,
+                )
+                return False
+            old_name = getattr(thread, "name", "") or ""
+            if old_name == new_name:
+                logger.info(
+                    "[%s] Discord thread title update skipped: reason=unchanged thread_id=%s name=%r",
+                    self.name,
+                    thread_id,
+                    old_name,
+                )
+                return False
+            await thread.edit(name=new_name, reason="Hermes auto-updated thread title from conversation context")
+            logger.info("[%s] Renamed Discord thread %s: %r -> %r", self.name, thread_id, old_name, new_name)
+            return True
+        except Exception as e:
+            logger.warning("[%s] Discord thread title update failed: reason=edit_failed thread_id=%s error=%s", self.name, thread_id, e, exc_info=True)
+            return False
+
     async def _auto_create_thread(self, message: 'DiscordMessage') -> Optional[Any]:
         """Create a thread from a user message for auto-threading.
 
