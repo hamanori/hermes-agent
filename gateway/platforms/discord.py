@@ -709,6 +709,40 @@ class DiscordAdapter(BasePlatformAdapter):
                 await adapter_self._resolve_allowed_usernames()
                 adapter_self._ready_event.set()
 
+                # Register persistent lifecycle buttons so already-sent thread
+                # cleanup controls continue to work after a gateway restart.
+                if (
+                    not adapter_self._thread_lifecycle_persistent_view_registered
+                    and adapter_self._thread_lifecycle_buttons_enabled()
+                ):
+                    try:
+                        adapter_self._client.add_view(
+                            ThreadLifecycleView(
+                                adapter=adapter_self,
+                                allowed_user_ids=adapter_self._allowed_user_ids,
+                                keep_archive_minutes=10080,
+                            )
+                        )
+                        adapter_self._thread_lifecycle_persistent_view_registered = True
+                    except Exception as e:
+                        logger.debug("Could not register Discord thread lifecycle persistent view: %s", e)
+
+                # Register persistent news article feedback buttons as well.
+                if (
+                    not adapter_self._news_article_persistent_view_registered
+                    and adapter_self._news_article_buttons_enabled()
+                ):
+                    try:
+                        adapter_self._client.add_view(
+                            NewsArticleFeedbackView(
+                                adapter=adapter_self,
+                                allowed_user_ids=adapter_self._allowed_user_ids,
+                            )
+                        )
+                        adapter_self._news_article_persistent_view_registered = True
+                    except Exception as e:
+                        logger.debug("Could not register Discord news article persistent view: %s", e)
+
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
                     adapter_self._post_connect_task.cancel()
                 adapter_self._post_connect_task = asyncio.create_task(
@@ -1412,7 +1446,15 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Format and split message if needed
             formatted = self.format_message(content)
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+
+            from gateway.markdown_table_images import segment_markdown_tables
+            table_segments = segment_markdown_tables(formatted)
+            table_segments_changed = (
+                len(table_segments) != 1
+                or (table_segments and table_segments[0].content != formatted)
+            )
+
+            news_segments = self._split_news_article_messages(formatted, channel, metadata)
 
             message_ids = []
             reference = None
@@ -1427,16 +1469,51 @@ class DiscordAdapter(BasePlatformAdapter):
                 except Exception as e:
                     logger.debug("Could not fetch reply-to message: %s", e)
 
-            for i, chunk in enumerate(chunks):
+            if table_segments_changed:
+                send_plan: list[tuple[str, str, bool]] = []
+                for segment in table_segments:
+                    if segment.kind == "image":
+                        send_plan.append(("image", segment.content, False))
+                        continue
+                    for chunk in self.truncate_message(segment.content, self.MAX_MESSAGE_LENGTH):
+                        if chunk.strip():
+                            send_plan.append(("text", chunk, False))
+                if send_plan:
+                    last_kind, last_value, _ = send_plan[-1]
+                    send_plan[-1] = (last_kind, last_value, True)
+            elif news_segments:
+                send_plan = []
+                for segment_text, attach_article_view in news_segments:
+                    segment_chunks = self.truncate_message(segment_text, self.MAX_MESSAGE_LENGTH)
+                    for idx, chunk in enumerate(segment_chunks):
+                        send_plan.append(("text", chunk, attach_article_view and idx == len(segment_chunks) - 1))
+            else:
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+                send_plan = [("text", chunk, i == len(chunks) - 1) for i, chunk in enumerate(chunks)]
+
+            for i, (item_kind, item_value, attach_view) in enumerate(send_plan):
                 if self._reply_to_mode == "all":
                     chunk_reference = reference
                 else:  # "first" (default) or "off"
                     chunk_reference = reference if i == 0 else None
+                view = (
+                    self._build_news_article_view(channel, metadata)
+                    if news_segments and attach_view and item_kind == "text"
+                    else self._build_message_action_view(channel, metadata)
+                    if attach_view
+                    else None
+                )
                 try:
-                    msg = await channel.send(
-                        content=chunk,
-                        reference=chunk_reference,
-                    )
+                    send_kwargs: dict[str, Any] = {"reference": chunk_reference}
+                    if view is not None:
+                        send_kwargs["view"] = view
+                    if item_kind == "image":
+                        with open(item_value, "rb") as image_file:
+                            send_kwargs["file"] = discord.File(image_file, filename=os.path.basename(item_value))
+                            msg = await channel.send(**send_kwargs)
+                    else:
+                        send_kwargs["content"] = item_value
+                        msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
                     if (
@@ -1455,10 +1532,16 @@ class DiscordAdapter(BasePlatformAdapter):
                             reply_to,
                         )
                         reference = None
-                        msg = await channel.send(
-                            content=chunk,
-                            reference=None,
-                        )
+                        retry_kwargs: dict[str, Any] = {"reference": None}
+                        if view is not None:
+                            retry_kwargs["view"] = view
+                        if item_kind == "image":
+                            with open(item_value, "rb") as image_file:
+                                retry_kwargs["file"] = discord.File(image_file, filename=os.path.basename(item_value))
+                                msg = await channel.send(**retry_kwargs)
+                        else:
+                            retry_kwargs["content"] = item_value
+                            msg = await channel.send(**retry_kwargs)
                     else:
                         raise
                 message_ids.append(str(msg.id))
@@ -1478,6 +1561,141 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to send Discord message: %s", self.name, e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    def _split_news_article_messages(
+        self,
+        content: str,
+        channel: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[list[tuple[str, bool]]]:
+        """Split a numbered news digest into per-article Discord messages.
+
+        The feedback buttons are article-level controls. A cron digest often
+        arrives as one Markdown response, so split top-level numbered article
+        blocks and attach buttons only to those article messages. Preamble and
+        SKIP/footer text stay buttonless.
+        """
+        if not DISCORD_AVAILABLE or isinstance(channel, discord.Thread):
+            return None
+        if not self._news_article_buttons_enabled():
+            return None
+        if not self._is_news_article_channel(channel, metadata):
+            return None
+
+        starts = list(re.finditer(r"(?m)^\s*(\d+)\.\s+\*\*", content or ""))
+        if len(starts) < 2:
+            return None
+
+        skip_match = re.search(r"(?m)^###\s+SKIP\b", content or "")
+        article_end_limit = skip_match.start() if skip_match else len(content)
+        starts = [m for m in starts if m.start() < article_end_limit]
+        if len(starts) < 2:
+            return None
+
+        segments: list[tuple[str, bool]] = []
+        preamble = content[: starts[0].start()].strip()
+        if preamble:
+            segments.append((preamble, False))
+
+        for idx, match in enumerate(starts):
+            next_start = starts[idx + 1].start() if idx + 1 < len(starts) else article_end_limit
+            article = content[match.start():next_start].strip()
+            if article:
+                segments.append((article, True))
+
+        tail = content[article_end_limit:].strip()
+        if tail:
+            segments.append((tail, False))
+
+        return segments or None
+
+    def _thread_lifecycle_buttons_enabled(self) -> bool:
+        """Return whether normal Discord thread replies should include cleanup buttons."""
+        raw = self.config.extra.get("thread_lifecycle_buttons", True)
+        if isinstance(raw, str):
+            return raw.lower() not in ("false", "0", "no", "off")
+        return bool(raw)
+
+    def _news_article_buttons_enabled(self) -> bool:
+        """Return whether news-channel messages should include article feedback buttons."""
+        raw = self.config.extra.get("news_article_buttons", True)
+        if isinstance(raw, str):
+            return raw.lower() not in ("false", "0", "no", "off")
+        return bool(raw)
+
+    def _news_article_button_channel_ids(self) -> set[str]:
+        """Configured Discord channels that should receive article feedback buttons."""
+        raw = self.config.extra.get("news_article_button_channels")
+        if raw is None:
+            raw = self.config.extra.get("news_channels")
+        if raw is None:
+            raw = [
+                "1498745024853053501",  # ai-news
+                "1498746404229611660",  # business-news
+                "1498746524480573581",  # sports-news
+                "1498746762595274772",  # f1-news
+                "1498746852378542353",  # football-news
+                "1498746917151182938",  # outings-news
+                "1498748157591556126",  # general news/category-crossing summaries
+            ]
+        if isinstance(raw, str):
+            raw = [part.strip() for part in raw.split(",") if part.strip()]
+        if not isinstance(raw, (list, tuple, set)):
+            return set()
+        return {str(item).strip() for item in raw if str(item).strip()}
+
+    def _is_news_article_channel(self, channel: Any, metadata: Optional[Dict[str, Any]] = None) -> bool:
+        if metadata and metadata.get("news_article_buttons") is False:
+            return False
+        if metadata and metadata.get("news_article_buttons") is True:
+            return True
+        channel_ids = self._news_article_button_channel_ids()
+        if not channel_ids:
+            return False
+        channel_id = str(getattr(channel, "id", "") or "")
+        parent_id = str(getattr(getattr(channel, "parent", None), "id", "") or "")
+        return channel_id in channel_ids or parent_id in channel_ids
+
+    def _build_news_article_view(self, channel: Any, metadata: Optional[Dict[str, Any]] = None):
+        """Build the per-article feedback buttons used in news channels.
+
+        The buttons add reactions to the article message.  That keeps the
+        downstream personalization signal compatible with existing
+        reaction/stamp-based workflows while making the user action one tap.
+        """
+        if not DISCORD_AVAILABLE or not self._news_article_buttons_enabled():
+            return None
+        if isinstance(channel, discord.Thread):
+            return None
+        if not self._is_news_article_channel(channel, metadata):
+            return None
+        return NewsArticleFeedbackView(adapter=self, allowed_user_ids=self._allowed_user_ids)
+
+    def _build_message_action_view(self, channel: Any, metadata: Optional[Dict[str, Any]] = None):
+        """Build a Discord button view for the final chunk of a sent message."""
+        news_view = self._build_news_article_view(channel, metadata)
+        if news_view is not None:
+            return news_view
+        return self._build_thread_lifecycle_view(channel, metadata)
+
+    def _build_thread_lifecycle_view(self, channel: Any, metadata: Optional[Dict[str, Any]] = None):
+        """Build the 4-button thread cleanup view for final Discord thread replies.
+
+        Progress/status/commentary sends can pass ``thread_lifecycle_buttons=False``
+        in metadata so the thread does not get a large button row under every
+        interim update.
+        """
+        if metadata and metadata.get("thread_lifecycle_buttons") is False:
+            return None
+        if not DISCORD_AVAILABLE or not self._thread_lifecycle_buttons_enabled():
+            return None
+        if not isinstance(channel, discord.Thread):
+            return None
+        return ThreadLifecycleView(
+            adapter=self,
+            allowed_user_ids=self._allowed_user_ids,
+            keep_archive_minutes=10080,
+        )
 
     async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
@@ -5025,6 +5243,404 @@ def _component_check_auth(
 
 
 if DISCORD_AVAILABLE:
+
+    class NewsArticleFeedbackView(discord.ui.View):
+        """One-tap per-article feedback controls for Discord news posts."""
+
+        FEEDBACK_REACTIONS = {
+            "read": "✅",
+            "keep": "⭐",
+            "skip": "👎",
+            "deep": "🧵",
+        }
+
+        def __init__(self, allowed_user_ids: set, adapter=None):
+            super().__init__(timeout=None)
+            self.allowed_user_ids = allowed_user_ids
+            self.adapter = adapter
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            if not self.allowed_user_ids:
+                return True
+            return str(interaction.user.id) in self.allowed_user_ids
+
+        async def _deny_if_unauthorized(self, interaction: discord.Interaction) -> bool:
+            if self._check_auth(interaction):
+                return False
+            await interaction.response.send_message("このボタンを使う権限がないみたいです〜", ephemeral=True)
+            return True
+
+        def _extract_article_url(self, message) -> str | None:
+            import re
+
+            content = getattr(message, "content", "") or ""
+            urls = re.findall(r"https?://[^\s)]+", content)
+            if urls:
+                return urls[0].rstrip('>.,)\"]}')
+            embeds = getattr(message, "embeds", None) or []
+            for embed in embeds:
+                url = getattr(embed, "url", None)
+                if url:
+                    return str(url)
+                footer = getattr(embed, "footer", None)
+                if footer:
+                    footer_text = getattr(footer, "text", None)
+                    if footer_text:
+                        urls = re.findall(r"https?://[^\s)]+", footer_text)
+                        if urls:
+                            return urls[0].rstrip('>.,)\"]}')
+            return None
+
+        def _article_title(self, message) -> str:
+            import re
+
+            content = getattr(message, "content", "") or ""
+            first_line = next((line.strip() for line in content.splitlines() if line.strip()), "")
+            first_line = re.sub(r"^\s*\d+\.\s*", "", first_line)
+            first_line = re.sub(r"\*\*(.*?)\*\*", r"\1", first_line)
+            first_line = re.sub(r"https?://\S+", "", first_line)
+            first_line = re.sub(r"[#*_`>\[\]()]", "", first_line)
+            first_line = re.sub(r"\s+", " ", first_line).strip(" -:：")
+            return first_line or "ニュース深掘り"
+
+        def _deep_dive_thread_name(self, message) -> str:
+            title = self._article_title(message)
+            name = title if title.startswith("深掘り:") else f"深掘り: {title}"
+            return name[:100]
+
+        def _deep_dive_prompt(self, message) -> str:
+            content = (getattr(message, "content", "") or "").strip()
+            url = self._extract_article_url(message)
+            lines = [
+                "このニュース記事の詳細版スレッドとして深掘りしてください。",
+                "",
+                "やってほしいこと:",
+                "- 元記事と関連情報を確認し、何が起きたかを整理する",
+                "- 背景、重要性、ユーザーが次に見るべき観点を分けて説明する",
+                "- 追加で追うべき一次情報・公式発表・信頼できる続報があれば挙げる",
+                "- 必要なら Life repo skills の x-browser / grok-browser を補助的に使い、日本語圏の反応・温度感・関連論点も確認する",
+                "- X/Grok 由来の情報は一次情報ではなく signal として明示し、公式情報や元記事と分けて扱う",
+                "- 日本語で、Discord で読みやすい粒度にする",
+            ]
+            if url:
+                lines.extend(["", f"元記事URL: {url}"])
+            if content:
+                lines.extend(["", "元のニュース項目:", content[:1800]])
+            return "\n".join(lines)
+
+        async def _create_deep_dive_thread(self, interaction: discord.Interaction, message) -> str | None:
+            if self.adapter is None:
+                return None
+
+            thread_name = self._deep_dive_thread_name(message)
+            reason = f"Deep Dive requested by {interaction.user.display_name} via Hermes news button"
+            try:
+                thread = await message.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=10080,
+                    reason=reason,
+                )
+            except Exception as direct_error:
+                channel = getattr(interaction, "channel", None) or getattr(message, "channel", None)
+                try:
+                    thread = await channel.create_thread(
+                        name=thread_name,
+                        auto_archive_duration=10080,
+                        reason=reason,
+                    )
+                    await thread.send(f"🧵 Deep Dive requested from: {getattr(message, 'jump_url', '')}")
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        "スレッド作成に失敗しました。"
+                        f" direct={direct_error}; fallback={fallback_error}"
+                    ) from fallback_error
+
+            thread_id = str(getattr(thread, "id", "") or "")
+            thread_name = getattr(thread, "name", None) or thread_name
+            if thread_id:
+                self.adapter._threads.mark(thread_id)
+
+            prompt = self._deep_dive_prompt(message)
+            asyncio.create_task(
+                self.adapter._dispatch_thread_session(
+                    interaction,
+                    thread_id,
+                    thread_name,
+                    prompt,
+                )
+            )
+            return f"<#{thread_id}>" if thread_id else f"**{thread_name}**"
+
+        def _persist_news_feedback(self, interaction: discord.Interaction, key: str, label: str, emoji: str) -> None:
+            try:
+                from hermes_constants import get_hermes_home
+                import json as _json
+                from datetime import datetime, timezone
+                from pathlib import Path
+
+                home = get_hermes_home()
+                state_dir = home / "state"
+                state_dir.mkdir(parents=True, exist_ok=True)
+                log_path = state_dir / "news_feedback.jsonl"
+                message = getattr(interaction, "message", None)
+                channel = getattr(interaction, "channel", None)
+                record = {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "reaction": key,
+                    "reaction_label": label,
+                    "reaction_emoji": emoji,
+                    "guild_id": str(getattr(getattr(interaction, "guild", None), "id", "") or ""),
+                    "channel_id": str(getattr(channel, "id", "") or ""),
+                    "thread_id": str(getattr(channel, "id", "") or "") if isinstance(channel, discord.Thread) else None,
+                    "message_id": str(getattr(message, "id", "") or ""),
+                    "user_id": str(getattr(getattr(interaction, "user", None), "id", "") or ""),
+                    "user_name": getattr(getattr(interaction, "user", None), "display_name", None),
+                    "job_name": getattr(self, "job_name", None),
+                    "topic": getattr(self, "topic", None),
+                    "article_url": self._extract_article_url(message) if message else None,
+                    "article_title": getattr(message, "content", "")[:500] if message else None,
+                }
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(_json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception:
+                logger.exception("Failed to persist news feedback event")
+
+        async def _mark(self, interaction: discord.Interaction, key: str, label: str) -> None:
+            if await self._deny_if_unauthorized(interaction):
+                return
+            message = getattr(interaction, "message", None)
+            if message is None:
+                await interaction.response.send_message("対象の記事メッセージが見つかりませんでした〜", ephemeral=True)
+                return
+
+            # Acknowledge the component interaction before doing Discord-side work.
+            # Adding reactions can be rate-limited or otherwise slow; if we wait for
+            # it before responding, Discord shows the user "This interaction failed".
+            await interaction.response.defer(ephemeral=True, thinking=False)
+
+            emoji = self.FEEDBACK_REACTIONS[key]
+            try:
+                await message.add_reaction(emoji)
+                self._persist_news_feedback(interaction, key, label, emoji)
+                if key == "deep":
+                    link = await self._create_deep_dive_thread(interaction, message)
+                    if link:
+                        await interaction.followup.send(
+                            f"{emoji} Deep Dive として記録して、詳細スレッド {link} を作りました〜",
+                            ephemeral=True,
+                        )
+                    else:
+                        await interaction.followup.send(
+                            f"{emoji} Deep Dive として記録しました。詳細スレッド作成は利用できません〜",
+                            ephemeral=True,
+                        )
+                else:
+                    await interaction.followup.send(f"{emoji} {label} として記録しました〜", ephemeral=True)
+            except Exception as exc:
+                await interaction.followup.send(f"記録に失敗しました: {exc}", ephemeral=True)
+
+        async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+            logger.exception("News article feedback button failed: item=%s", item, exc_info=error)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("ボタン処理でエラーになりました〜", ephemeral=True)
+            else:
+                await interaction.followup.send("ボタン処理でエラーになりました〜", ephemeral=True)
+
+        @discord.ui.button(label="Read", style=discord.ButtonStyle.green, emoji="✅", custom_id="news_article_read")
+        async def read_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "read", "Read")
+
+        @discord.ui.button(label="More", style=discord.ButtonStyle.blurple, emoji="⭐", custom_id="news_article_keep")
+        async def keep_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "keep", "More")
+
+        @discord.ui.button(label="Less", style=discord.ButtonStyle.grey, emoji="👎", custom_id="news_article_skip")
+        async def skip_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "skip", "Less")
+
+        @discord.ui.button(label="Deep Dive", style=discord.ButtonStyle.grey, emoji="🧵", custom_id="news_article_deep")
+        async def deep_dive_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "deep", "Deep Dive")
+
+
+    class ThreadLifecycleView(discord.ui.View):
+        """Seven quick cleanup/summary actions for normal Hermes Discord thread replies."""
+
+        def __init__(self, adapter, allowed_user_ids: set, keep_archive_minutes: int = 10080):
+            super().__init__(timeout=None)
+            self.adapter = adapter
+            self.allowed_user_ids = allowed_user_ids
+            self.keep_archive_minutes = keep_archive_minutes
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            if not self.allowed_user_ids:
+                return True
+            return str(interaction.user.id) in self.allowed_user_ids
+
+        async def _deny_if_unauthorized(self, interaction: discord.Interaction) -> bool:
+            if self._check_auth(interaction):
+                return False
+            await interaction.response.send_message("このボタンを使う権限がないみたいです〜", ephemeral=True)
+            return True
+
+        async def _thread(self, interaction: discord.Interaction):
+            channel = getattr(interaction, "channel", None)
+            if isinstance(channel, discord.Thread):
+                return channel
+            await interaction.response.send_message("これはスレッド内でだけ使えます〜", ephemeral=True)
+            return None
+
+        def _disable_close_button(self):
+            for child in self.children:
+                if getattr(child, "custom_id", "") == "thread_lifecycle_close":
+                    child.disabled = True
+
+        @discord.ui.button(style=discord.ButtonStyle.green, emoji="✅", custom_id="thread_lifecycle_close", row=0)
+        async def close_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            self._disable_close_button()
+            await interaction.response.edit_message(view=self)
+            try:
+                await thread.edit(archived=True, reason=f"Closed by {interaction.user.display_name} via Hermes button")
+            except Exception as exc:
+                await interaction.followup.send(f"閉じるのに失敗しました: {exc}", ephemeral=True)
+
+        @discord.ui.button(style=discord.ButtonStyle.blurple, emoji="📌", custom_id="thread_lifecycle_keep", row=0)
+        async def keep_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            await interaction.response.defer(ephemeral=True, thinking=False)
+            try:
+                name = getattr(thread, "name", "") or ""
+                new_name = name if name.startswith("継続:") else f"継続: {name}"[:100]
+                await thread.edit(
+                    name=new_name,
+                    archived=False,
+                    auto_archive_duration=self.keep_archive_minutes,
+                    reason=f"Kept by {interaction.user.display_name} via Hermes button",
+                )
+                await interaction.followup.send("📌 継続扱いにして、自動アーカイブを延長しました〜", ephemeral=True)
+            except Exception as exc:
+                await interaction.followup.send(f"継続設定に失敗しました: {exc}", ephemeral=True)
+
+        async def _resume_thread_action(self, interaction: discord.Interaction) -> None:
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            await interaction.response.defer(ephemeral=True, thinking=False)
+            try:
+                name = getattr(thread, "name", "") or ""
+                if name.startswith("継続:"):
+                    name = name.removeprefix("継続:").strip()
+                new_name = f"継続: {name}" if name else "継続"
+                await thread.edit(
+                    name=new_name[:100],
+                    archived=False,
+                    auto_archive_duration=self.keep_archive_minutes,
+                    reason=f"Resumed by {interaction.user.display_name} via Hermes button",
+                )
+                await interaction.followup.send("🔄 続きから応答します〜", ephemeral=True)
+                await self._dispatch_agent_request(
+                    interaction,
+                    "このスレッドの直前の文脈を読んで、止まっていた続きの応答をしてください。"
+                    "新しい依頼を作り直すのではなく、未完了の回答・作業・確認があればそこから再開してください。",
+                )
+            except Exception as exc:
+                await interaction.followup.send(f"再開に失敗しました: {exc}", ephemeral=True)
+
+        @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="🔄", custom_id="thread_lifecycle_resume", row=0)
+        async def resume_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._resume_thread_action(interaction)
+
+        async def _dispatch_agent_request(self, interaction: discord.Interaction, text: str) -> None:
+            thread = getattr(interaction, "channel", None)
+            if not isinstance(thread, discord.Thread):
+                return
+            parent = getattr(thread, "parent", None)
+            guild = getattr(thread, "guild", None) or getattr(parent, "guild", None)
+            guild_name = getattr(guild, "name", "") or ""
+            chat_name = self.adapter._format_thread_chat_name(thread)
+            chat_topic = self.adapter._get_effective_topic(thread, is_thread=True)
+            source = self.adapter.build_source(
+                chat_id=str(thread.id),
+                chat_name=chat_name or (f"{guild_name} / {thread.name}" if guild_name else thread.name),
+                chat_type="thread",
+                user_id=str(interaction.user.id),
+                user_name=interaction.user.display_name,
+                thread_id=str(thread.id),
+                chat_topic=chat_topic,
+            )
+            parent_id = str(getattr(parent, "id", "") or "")
+            event = MessageEvent(
+                text=text,
+                message_type=MessageType.TEXT,
+                source=source,
+                raw_message=interaction,
+                auto_skill=self.adapter._resolve_channel_skills(str(thread.id), parent_id or None),
+                channel_prompt=self.adapter._resolve_channel_prompt(str(thread.id), parent_id or None),
+            )
+            asyncio.create_task(self.adapter.handle_message(event))
+
+        @discord.ui.button(style=discord.ButtonStyle.grey, emoji="📝", custom_id="thread_lifecycle_issue", row=1)
+        async def create_issue_hint(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            await interaction.response.send_message("📝 Issue化を始めますね〜", ephemeral=True)
+            await self._dispatch_agent_request(
+                interaction,
+                "このスレッドの内容を要約して GitHub Issue にしてください。作成後、このスレッドは閉じる候補にしてください。",
+            )
+
+        @discord.ui.button(style=discord.ButtonStyle.grey, emoji="💡", custom_id="thread_lifecycle_later", row=1)
+        async def organize_later_hint(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            await interaction.response.send_message("💡 アイデアとして整理しますね〜", ephemeral=True)
+            await self._dispatch_agent_request(
+                interaction,
+                "このスレッドの内容をアイデアとして整理して、必要なら #ideas に送るべきか判断してください。",
+            )
+
+        @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="📚", custom_id="thread_lifecycle_wiki", row=1)
+        async def wiki_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            await interaction.response.send_message("📚 llm-wiki 候補に入れますね〜", ephemeral=True)
+            await self._dispatch_agent_request(
+                interaction,
+                "このスレッドの内容を llm-wiki に書き込む候補として整理してください。知識として残すべき要点、再利用できる事実、注意点を抽出してください。",
+            )
+
+        @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="🧾", custom_id="thread_lifecycle_summary", row=1)
+        async def summarize_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            if await self._deny_if_unauthorized(interaction):
+                return
+            thread = await self._thread(interaction)
+            if not thread:
+                return
+            await interaction.response.send_message("🧾 要約を始めますね〜", ephemeral=True)
+            await self._dispatch_agent_request(
+                interaction,
+                "このスレッドの内容を短く要約して、要点・決定事項・未決事項に分けてまとめてください。",
+            )
 
     class ExecApprovalView(discord.ui.View):
         """

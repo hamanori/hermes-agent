@@ -603,8 +603,58 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.WEIXIN:
         return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
 
-    # --- Discord: special handling for media attachments ---
+    # --- Discord: special handling for media attachments and table images ---
     if platform == Platform.DISCORD:
+        from gateway.markdown_table_images import segment_markdown_tables
+
+        table_segments = segment_markdown_tables(message)
+        table_segments_changed = (
+            len(table_segments) != 1
+            or (table_segments and table_segments[0].content != message)
+        )
+        if table_segments_changed:
+            last_result = None
+            for segment in table_segments:
+                if segment.kind == "image":
+                    result = await _send_discord(
+                        pconfig.token,
+                        chat_id,
+                        "",
+                        media_files=[(segment.content, False)],
+                        thread_id=thread_id,
+                    )
+                    if isinstance(result, dict) and result.get("error"):
+                        return result
+                    last_result = result
+                    continue
+
+                segment_chunks = BasePlatformAdapter.truncate_message(segment.content, DiscordAdapter.MAX_MESSAGE_LENGTH)
+                for chunk in segment_chunks:
+                    if not chunk.strip():
+                        continue
+                    result = await _send_discord(
+                        pconfig.token,
+                        chat_id,
+                        chunk,
+                        media_files=[],
+                        thread_id=thread_id,
+                    )
+                    if isinstance(result, dict) and result.get("error"):
+                        return result
+                    last_result = result
+            if media_files:
+                result = await _send_discord(
+                    pconfig.token,
+                    chat_id,
+                    "",
+                    media_files=media_files,
+                    thread_id=thread_id,
+                )
+                if isinstance(result, dict) and result.get("error"):
+                    return result
+                last_result = result
+            return last_result
+
         last_result = None
         for i, chunk in enumerate(chunks):
             is_last = (i == len(chunks) - 1)

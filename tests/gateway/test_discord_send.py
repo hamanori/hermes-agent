@@ -445,3 +445,30 @@ async def test_typing_stop_cleans_up():
 
     await adapter.stop_typing("12345")
     assert "12345" not in adapter._typing_tasks
+@pytest.mark.asyncio
+async def test_send_renders_markdown_table_as_image_segment(monkeypatch, tmp_path):
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    image_path = tmp_path / "table.png"
+    image_path.write_bytes(b"png")
+    monkeypatch.setattr("gateway.markdown_table_images.render_table_pngs", lambda table, output_dir=None: [str(image_path)])
+
+    sent_msg = SimpleNamespace(id=1234)
+    send_calls = []
+
+    async def fake_send(**kwargs):
+        send_calls.append(kwargs)
+        return sent_msg
+
+    channel = SimpleNamespace(send=AsyncMock(side_effect=fake_send))
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("555", "Before\n\n| A | B |\n|---|---|\n| x | y |\n\nAfter")
+
+    assert result.success is True
+    assert channel.send.await_count == 3
+    assert send_calls[0]["content"].strip() == "Before"
+    assert "file" in send_calls[1]
+    assert send_calls[2]["content"].strip() == "After"
