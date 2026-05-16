@@ -593,6 +593,12 @@ class DiscordAdapter(BasePlatformAdapter):
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
         self._last_self_message_id: Dict[str, str] = {}
+        # Persistent Discord UI views must be registered once per adapter
+        # process after on_ready fires.  Initialize the guards before connect()
+        # installs the on_ready closure so startup cannot trip over missing
+        # attributes when lifecycle/news buttons are enabled.
+        self._thread_lifecycle_persistent_view_registered = False
+        self._news_article_persistent_view_registered = False
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
