@@ -80,6 +80,13 @@ def _speed_up_command_sync_mutation_pacing(monkeypatch):
     )
 
 
+def test_adapter_initializes_persistent_view_registration_flags():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="test-token"))
+
+    assert adapter._thread_lifecycle_persistent_view_registered is False
+    assert adapter._news_article_persistent_view_registered is False
+
+
 class FakeTree:
     def __init__(self):
         self.sync = AsyncMock(return_value=[])
