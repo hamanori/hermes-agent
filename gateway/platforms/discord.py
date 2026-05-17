@@ -601,6 +601,7 @@ class DiscordAdapter(BasePlatformAdapter):
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
         self._thread_lifecycle_persistent_view_registered: bool = False
         self._news_article_persistent_view_registered: bool = False
+        self._wiki_proposal_persistent_view_registered: bool = False
         self._todoist_classifier = None
         self._todoist_client_cls = None
 
@@ -752,6 +753,22 @@ class DiscordAdapter(BasePlatformAdapter):
                         adapter_self._news_article_persistent_view_registered = True
                     except Exception as e:
                         logger.debug("Could not register Discord news article persistent view: %s", e)
+
+                # Register persistent Wiki proposal decision buttons as well.
+                if (
+                    not adapter_self._wiki_proposal_persistent_view_registered
+                    and adapter_self._thread_lifecycle_buttons_enabled()
+                ):
+                    try:
+                        adapter_self._client.add_view(
+                            WikiProposalDecisionView(
+                                adapter=adapter_self,
+                                allowed_user_ids=adapter_self._allowed_user_ids,
+                            )
+                        )
+                        adapter_self._wiki_proposal_persistent_view_registered = True
+                    except Exception as e:
+                        logger.debug("Could not register Discord wiki proposal persistent view: %s", e)
 
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
                     adapter_self._post_connect_task.cancel()
@@ -1704,6 +1721,10 @@ class DiscordAdapter(BasePlatformAdapter):
         news_view = self._build_news_article_view(channel, metadata)
         if news_view is not None:
             return news_view
+        if metadata and metadata.get("wiki_proposal") is True:
+            if not DISCORD_AVAILABLE or not isinstance(channel, discord.Thread):
+                return None
+            return WikiProposalDecisionView(adapter=self, allowed_user_ids=self._allowed_user_ids)
         return self._build_thread_lifecycle_view(channel, metadata)
 
     def _build_thread_lifecycle_view(self, channel: Any, metadata: Optional[Dict[str, Any]] = None):
@@ -5346,6 +5367,41 @@ def _component_check_auth(
     return False
 
 
+THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE = (
+    "📚 Wiki候補を作りますね〜 まだ書き込みません。Save/Edit/Skipで選べる形にします。"
+)
+
+THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT = """このスレッド全体を読んで、Life repo の knowledge/ に保存する候補を proposal-only で作ってください。
+この段階では絶対にファイルを書き込まないでください。まだファイルは変更しないでください。Wiki は直接書き込みではなく候補作成です。
+
+必ず出力に次の行を含めてください:
+Status: proposal only; no files have been changed yet.
+
+保存不要なら「保存不要」と明記し、保存しない理由だけを返してください。
+保存候補がある場合だけ、次の項目をすべて含めてください:
+- 保存判定
+- 理由
+- 推奨保存先（raw/articles, concepts, entities, comparisons, queries, preferences, 保存しない のいずれか）
+- 新規作成or既存ページ更新候補
+- 保存本文案の要約
+- hiro確認事項
+- 次の操作案: Save/Edit/Skip（表示文言は Save / Edit / Skip でもよい）
+
+推奨保存先の分類基準:
+- raw/articles: 外部記事・一次情報・長めの引用元を原資料として残す候補
+- concepts: 再利用できる考え方・運用方針・判断軸
+- entities: 人物・組織・サービス・場所などの固有対象
+- comparisons: 複数候補の比較、選定理由、トレードオフ
+- queries: 後で再実行したい調査クエリや検索条件
+- preferences: hiro の長期的な好み・生活/運用上の優先順位
+- 保存しない: 一時的、既存知識と重複、または保存価値が薄い内容
+
+既存の Life 方針として、#ideas を Issue intake として扱わないでください。
+Save が選ばれた場合だけ、実際の反映作業を Kanban タスクとして起票・実行する方針を説明してください。
+その Kanban 作業には Life repo の knowledge/ への反映、index 更新、log 記録、lint、commit、push の要件を含め、Discord ボタンの同期処理として直接ファイルを書き込まないでください。
+"""
+
+
 if DISCORD_AVAILABLE:
 
     class NewsArticleFeedbackView(discord.ui.View):
@@ -5567,6 +5623,179 @@ if DISCORD_AVAILABLE:
             await self._mark(interaction, "deep", "Deep Dive")
 
 
+    async def _dispatch_thread_agent_request(
+        adapter,
+        interaction: discord.Interaction,
+        thread,
+        text: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        parent = getattr(thread, "parent", None)
+        guild = getattr(thread, "guild", None) or getattr(parent, "guild", None)
+        guild_name = getattr(guild, "name", "") or ""
+        chat_name = adapter._format_thread_chat_name(thread)
+        chat_topic = adapter._get_effective_topic(thread, is_thread=True)
+        source = adapter.build_source(
+            chat_id=str(thread.id),
+            chat_name=chat_name or (f"{guild_name} / {thread.name}" if guild_name else thread.name),
+            chat_type="thread",
+            user_id=str(interaction.user.id),
+            user_name=interaction.user.display_name,
+            thread_id=str(thread.id),
+            chat_topic=chat_topic,
+        )
+        parent_id = str(getattr(parent, "id", "") or "")
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=interaction,
+            auto_skill=adapter._resolve_channel_skills(str(thread.id), parent_id or None),
+            channel_prompt=adapter._resolve_channel_prompt(str(thread.id), parent_id or None),
+            metadata=metadata or None,
+        )
+        asyncio.create_task(adapter.handle_message(event))
+
+
+    class WikiProposalEditModal(discord.ui.Modal):
+        """Collect concrete guidance before asking the agent to revise a Wiki proposal."""
+
+        guidance = discord.ui.TextInput(
+            label="編集指示",
+            style=discord.TextStyle.paragraph,
+            placeholder="例: preferences ではなく concepts に寄せて、保存本文案を短くしてください",
+            required=True,
+            max_length=1500,
+        )
+
+        def __init__(self, decision_view: "WikiProposalDecisionView"):
+            super().__init__(title="Wiki候補の編集", timeout=300, custom_id="wiki_proposal_edit_modal")
+            self.decision_view = decision_view
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            guidance = str(self.guidance.value or "").strip()
+            if not guidance:
+                await interaction.response.send_message("編集指示を少し書いてください〜", ephemeral=True)
+                return
+            await self.decision_view._edit_candidate_submit(interaction, guidance)
+
+        async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+            logger.exception("Wiki proposal edit modal failed", exc_info=error)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("Edit指示の受付でエラーになりました〜", ephemeral=True)
+            else:
+                await interaction.followup.send("Edit指示の受付でエラーになりました〜", ephemeral=True)
+
+
+    class WikiProposalDecisionView(discord.ui.View):
+        """Save/Edit/Skip controls shown under Wiki proposal-only candidate replies."""
+
+        def __init__(self, adapter, allowed_user_ids: set):
+            super().__init__(timeout=None)
+            self.adapter = adapter
+            self.allowed_user_ids = allowed_user_ids
+            if not getattr(self, "children", None) and hasattr(discord.ui, "Button"):
+                self.add_item(discord.ui.Button(label="Save", style=discord.ButtonStyle.green, custom_id="wiki_proposal_save", row=0))
+                self.add_item(discord.ui.Button(label="Edit", style=discord.ButtonStyle.blurple, custom_id="wiki_proposal_edit", row=0))
+                self.add_item(discord.ui.Button(label="Skip", style=discord.ButtonStyle.grey, custom_id="wiki_proposal_skip", row=0))
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            if not self.allowed_user_ids:
+                return True
+            return str(interaction.user.id) in self.allowed_user_ids
+
+        async def _deny_if_unauthorized(self, interaction: discord.Interaction) -> bool:
+            if self._check_auth(interaction):
+                return False
+            await interaction.response.send_message("このボタンを使う権限がないみたいです〜", ephemeral=True)
+            return True
+
+        def _proposal_text(self, interaction: discord.Interaction) -> str:
+            message = getattr(interaction, "message", None)
+            return (getattr(message, "content", "") or "").strip()
+
+        async def _dispatch_agent_request(
+            self,
+            interaction: discord.Interaction,
+            text: str,
+            metadata: Optional[Dict[str, Any]] = None,
+        ) -> None:
+            thread = getattr(interaction, "channel", None)
+            if not isinstance(thread, discord.Thread):
+                return
+            await _dispatch_thread_agent_request(self.adapter, interaction, thread, text, metadata=metadata)
+
+        def _save_prompt(self, interaction: discord.Interaction) -> str:
+            proposal = self._proposal_text(interaction)
+            return (
+                "この Wiki 候補を保存反映する Kanban タスクを作成してください。\n"
+                "Discord ボタンの同期処理として直接ファイルを書き込まないでください。\n"
+                "タスクには Life repo の knowledge/ への反映、index 更新、log 記録、lint、commit、push を含めてください。\n\n"
+                "Wiki候補:\n"
+                f"{proposal[:3500]}"
+            )
+
+        def _edit_prompt(self, interaction: discord.Interaction, guidance: str) -> str:
+            proposal = self._proposal_text(interaction)
+            return (
+                "この Wiki 候補を、ユーザーの編集指示に従って proposal-only で作り直してください。\n"
+                "まだファイルは変更しないでください。必ず次の行を含めてください:\n"
+                "Status: proposal only; no files have been changed yet.\n\n"
+                f"編集指示:\n{guidance.strip()}\n\n"
+                f"元のWiki候補:\n{proposal[:3200]}"
+            )
+
+        async def _save_candidate_action(self, interaction: discord.Interaction) -> None:
+            if await self._deny_if_unauthorized(interaction):
+                return
+            await interaction.response.defer(ephemeral=True, thinking=False)
+            await interaction.followup.send("保存タスクを起票します。ファイルはまだ変更してません〜", ephemeral=True)
+            await self._dispatch_agent_request(
+                interaction,
+                self._save_prompt(interaction),
+                metadata={"thread_lifecycle_buttons": False},
+            )
+
+        async def _edit_candidate_action(self, interaction: discord.Interaction) -> None:
+            if await self._deny_if_unauthorized(interaction):
+                return
+            send_modal = getattr(interaction.response, "send_modal", None)
+            if send_modal is None:
+                await interaction.response.send_message(
+                    "Edit指示の入力欄を開けませんでした。修正内容を書いてからもう一度押してください〜",
+                    ephemeral=True,
+                )
+                return
+            await send_modal(WikiProposalEditModal(self))
+
+        async def _edit_candidate_submit(self, interaction: discord.Interaction, guidance: str) -> None:
+            await interaction.response.defer(ephemeral=True, thinking=False)
+            await interaction.followup.send("Edit指示を反映する候補を作り直します〜", ephemeral=True)
+            await self._dispatch_agent_request(
+                interaction,
+                self._edit_prompt(interaction, guidance),
+                metadata={"wiki_proposal": True, "thread_lifecycle_buttons": False},
+            )
+
+        async def _skip_candidate_action(self, interaction: discord.Interaction) -> None:
+            if await self._deny_if_unauthorized(interaction):
+                return
+            await interaction.response.defer(ephemeral=True, thinking=False)
+            await interaction.followup.send("Skipしました。ファイルは変更してません〜", ephemeral=True)
+
+        @discord.ui.button(label="Save", style=discord.ButtonStyle.green, custom_id="wiki_proposal_save", row=0)
+        async def save_candidate(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._save_candidate_action(interaction)
+
+        @discord.ui.button(label="Edit", style=discord.ButtonStyle.blurple, custom_id="wiki_proposal_edit", row=0)
+        async def edit_candidate(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._edit_candidate_action(interaction)
+
+        @discord.ui.button(label="Skip", style=discord.ButtonStyle.grey, custom_id="wiki_proposal_skip", row=0)
+        async def skip_candidate(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._skip_candidate_action(interaction)
+
+
     class ThreadLifecycleView(discord.ui.View):
         """Seven quick cleanup/summary actions for normal Hermes Discord thread replies."""
 
@@ -5665,34 +5894,11 @@ if DISCORD_AVAILABLE:
         async def resume_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
             await self._resume_thread_action(interaction)
 
-        async def _dispatch_agent_request(self, interaction: discord.Interaction, text: str) -> None:
+        async def _dispatch_agent_request(self, interaction: discord.Interaction, text: str, metadata: Optional[Dict[str, Any]] = None) -> None:
             thread = getattr(interaction, "channel", None)
             if not isinstance(thread, discord.Thread):
                 return
-            parent = getattr(thread, "parent", None)
-            guild = getattr(thread, "guild", None) or getattr(parent, "guild", None)
-            guild_name = getattr(guild, "name", "") or ""
-            chat_name = self.adapter._format_thread_chat_name(thread)
-            chat_topic = self.adapter._get_effective_topic(thread, is_thread=True)
-            source = self.adapter.build_source(
-                chat_id=str(thread.id),
-                chat_name=chat_name or (f"{guild_name} / {thread.name}" if guild_name else thread.name),
-                chat_type="thread",
-                user_id=str(interaction.user.id),
-                user_name=interaction.user.display_name,
-                thread_id=str(thread.id),
-                chat_topic=chat_topic,
-            )
-            parent_id = str(getattr(parent, "id", "") or "")
-            event = MessageEvent(
-                text=text,
-                message_type=MessageType.TEXT,
-                source=source,
-                raw_message=interaction,
-                auto_skill=self.adapter._resolve_channel_skills(str(thread.id), parent_id or None),
-                channel_prompt=self.adapter._resolve_channel_prompt(str(thread.id), parent_id or None),
-            )
-            asyncio.create_task(self.adapter.handle_message(event))
+            await _dispatch_thread_agent_request(self.adapter, interaction, thread, text, metadata=metadata)
 
         @discord.ui.button(style=discord.ButtonStyle.grey, emoji="📝", custom_id="thread_lifecycle_issue", row=1)
         async def create_issue_hint(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -5720,18 +5926,22 @@ if DISCORD_AVAILABLE:
                 "このスレッドの内容をアイデアとして整理して、必要なら #ideas に送るべきか判断してください。",
             )
 
-        @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="📚", custom_id="thread_lifecycle_wiki", row=1)
-        async def wiki_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def _wiki_thread_action(self, interaction: discord.Interaction) -> None:
             if await self._deny_if_unauthorized(interaction):
                 return
             thread = await self._thread(interaction)
             if not thread:
                 return
-            await interaction.response.send_message("📚 llm-wiki 候補に入れますね〜", ephemeral=True)
+            await interaction.response.send_message(THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE, ephemeral=True)
             await self._dispatch_agent_request(
                 interaction,
-                "このスレッドの内容を llm-wiki に書き込む候補として整理してください。知識として残すべき要点、再利用できる事実、注意点を抽出してください。",
+                THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT,
+                metadata={"wiki_proposal": True, "thread_lifecycle_buttons": False},
             )
+
+        @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="📚", custom_id="thread_lifecycle_wiki", row=1)
+        async def wiki_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._wiki_thread_action(interaction)
 
         @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="🧾", custom_id="thread_lifecycle_summary", row=1)
         async def summarize_thread(self, interaction: discord.Interaction, button: discord.ui.Button):

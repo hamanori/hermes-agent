@@ -909,6 +909,11 @@ class MessageEvent:
     # Per-channel ephemeral system prompt (e.g. Discord channel_prompts).
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
+
+    # Per-event delivery metadata to merge into outgoing responses generated
+    # from this synthetic/user event.  Platform button flows use this to attach
+    # response-scoped views without changing the session source.
+    metadata: Optional[Dict[str, Any]] = None
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
@@ -2784,6 +2789,8 @@ class BasePlatformAdapter(ABC):
         
         # Start continuous typing indicator (refreshes every 2 seconds)
         _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        if event.metadata:
+            _thread_metadata = {**(_thread_metadata or {}), **event.metadata}
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
             _keep_typing_sig = inspect.signature(self._keep_typing)
