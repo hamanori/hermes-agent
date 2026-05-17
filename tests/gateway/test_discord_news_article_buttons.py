@@ -290,14 +290,16 @@ async def test_wiki_button_dispatches_proposal_only_life_knowledge_request():
 
 def test_wiki_proposal_prompt_is_save_edit_skip_candidate_flow():
     assert THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE == (
-        "📚 Wiki保存候補だけ作りますね〜 まだファイルは変更しません。Save/Edit/Skipで選べる形にします。"
+        "📚 Wiki候補を作りますね〜 まだ書き込みません。Save/Edit/Skipで選べる形にします。"
     )
     prompt = THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT
     assert "このスレッド全体を読んで" in prompt
     assert "Life repo の knowledge/ に保存する候補" in prompt
     assert "まだファイルは変更しない" in prompt
     assert "Status: proposal only; no files have been changed yet." in prompt
-    assert "保存不要なら保存不要と理由" in prompt
+    assert "保存不要なら「保存不要」と明記" in prompt
+    assert "保存しない理由だけ" in prompt
+    assert "保存候補がある場合だけ" in prompt
     assert "#ideas を Issue intake として扱わない" in prompt
     assert "Wiki は直接書き込みではなく候補作成" in prompt
     assert "Save/Edit/Skip" in prompt
@@ -308,6 +310,16 @@ def test_wiki_proposal_prompt_is_save_edit_skip_candidate_flow():
         "新規作成or既存ページ更新候補",
         "保存本文案の要約",
         "hiro確認事項",
-        "次の操作ボタン",
+        "次の操作案",
     ]:
         assert required_heading in prompt
+    for storage_category in [
+        "raw/articles",
+        "concepts",
+        "entities",
+        "comparisons",
+        "queries",
+        "preferences",
+        "保存しない",
+    ]:
+        assert storage_category in prompt
