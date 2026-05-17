@@ -133,13 +133,32 @@ def _ensure_discord_mock() -> None:
     # tests that subclass ModelPickerView / iterate .children / clear
     # items work.
     class _FakeView:
-        def __init__(self, timeout=None):
+        def __init__(self, timeout=None, **_):
             self.timeout = timeout
             self.children = []
         def add_item(self, item):
             self.children.append(item)
         def clear_items(self):
             self.children.clear()
+
+    class _FakeModal(_FakeView):
+        def __init__(self, *, title=None, timeout=None, custom_id=None, **_):
+            super().__init__(timeout=timeout)
+            self.title = title
+            self.custom_id = custom_id
+
+    class _FakeTextInput:
+        def __init__(self, *, label=None, style=None, placeholder=None, required=True, max_length=None, **_):
+            self.label = label
+            self.style = style
+            self.placeholder = placeholder
+            self.required = required
+            self.max_length = max_length
+            self.default = ""
+            self._value = ""
+        @property
+        def value(self):
+            return self._value or self.default
 
     class _FakeSelect:
         def __init__(self, *, placeholder=None, options=None, custom_id=None, **_):
@@ -171,10 +190,13 @@ def _ensure_discord_mock() -> None:
 
     discord_mod.ui = SimpleNamespace(
         View=_FakeView,
+        Modal=_FakeModal,
         Select=_FakeSelect,
         Button=_FakeButton,
+        TextInput=_FakeTextInput,
         button=lambda *a, **k: (lambda fn: fn),
     )
+    discord_mod.TextStyle = SimpleNamespace(paragraph=2, short=1)
     discord_mod.ButtonStyle = SimpleNamespace(
         success=1, primary=2, secondary=2, danger=3,
         green=1, grey=2, blurple=2, red=3,

@@ -5559,6 +5559,36 @@ if DISCORD_AVAILABLE:
         asyncio.create_task(adapter.handle_message(event))
 
 
+    class WikiProposalEditModal(discord.ui.Modal):
+        """Collect concrete guidance before asking the agent to revise a Wiki proposal."""
+
+        guidance = discord.ui.TextInput(
+            label="編集指示",
+            style=discord.TextStyle.paragraph,
+            placeholder="例: preferences ではなく concepts に寄せて、保存本文案を短くしてください",
+            required=True,
+            max_length=1500,
+        )
+
+        def __init__(self, decision_view: "WikiProposalDecisionView"):
+            super().__init__(title="Wiki候補の編集", timeout=300, custom_id="wiki_proposal_edit_modal")
+            self.decision_view = decision_view
+
+        async def on_submit(self, interaction: discord.Interaction) -> None:
+            guidance = str(self.guidance.value or "").strip()
+            if not guidance:
+                await interaction.response.send_message("編集指示を少し書いてください〜", ephemeral=True)
+                return
+            await self.decision_view._edit_candidate_submit(interaction, guidance)
+
+        async def on_error(self, interaction: discord.Interaction, error: Exception) -> None:
+            logger.exception("Wiki proposal edit modal failed", exc_info=error)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("Edit指示の受付でエラーになりました〜", ephemeral=True)
+            else:
+                await interaction.followup.send("Edit指示の受付でエラーになりました〜", ephemeral=True)
+
+
     class WikiProposalDecisionView(discord.ui.View):
         """Save/Edit/Skip controls shown under Wiki proposal-only candidate replies."""
 
@@ -5631,13 +5661,14 @@ if DISCORD_AVAILABLE:
         async def _edit_candidate_action(self, interaction: discord.Interaction) -> None:
             if await self._deny_if_unauthorized(interaction):
                 return
-            await interaction.response.defer(ephemeral=True, thinking=False)
-            await interaction.followup.send("Edit候補を作り直します。具体的な修正は続けてスレッドに書いてください〜", ephemeral=True)
-            await self._dispatch_agent_request(
-                interaction,
-                self._edit_prompt(interaction, "Save/Edit/Skip の Edit が押されました。元候補を proposal-only で改善してください。"),
-                metadata={"wiki_proposal": True, "thread_lifecycle_buttons": False},
-            )
+            send_modal = getattr(interaction.response, "send_modal", None)
+            if send_modal is None:
+                await interaction.response.send_message(
+                    "Edit指示の入力欄を開けませんでした。修正内容を書いてからもう一度押してください〜",
+                    ephemeral=True,
+                )
+                return
+            await send_modal(WikiProposalEditModal(self))
 
         async def _edit_candidate_submit(self, interaction: discord.Interaction, guidance: str) -> None:
             await interaction.response.defer(ephemeral=True, thinking=False)
