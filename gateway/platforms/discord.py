@@ -5317,11 +5317,11 @@ def _component_check_auth(
 
 
 THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE = (
-    "📚 llm-wiki 保存提案を作りますね〜。まだ書き込みません。Save/Edit/Skipで選べる形にします。"
+    "📚 Wiki保存候補だけ作りますね〜 まだファイルは変更しません。Save/Edit/Skipで選べる形にします。"
 )
 
 THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT = """このスレッド全体を読んで、Life repo の knowledge/ に保存する候補を proposal-only で作ってください。
-この段階では絶対にファイルを書き込まないでください。Wiki は直接書き込みではなく候補作成です。
+この段階では絶対にファイルを書き込まないでください。まだファイルは変更しないでください。Wiki は直接書き込みではなく候補作成です。
 
 必ず出力に次の行を含めてください:
 Status: proposal only; no files have been changed yet.
@@ -5336,7 +5336,7 @@ Status: proposal only; no files have been changed yet.
 - 新規作成or既存ページ更新候補
 - 保存本文案の要約
 - hiro確認事項
-- 次の操作ボタン: Save / Edit / Skip
+- 次の操作ボタン: Save/Edit/Skip（表示文言は Save / Edit / Skip でもよい）
 
 Save が選ばれた場合だけ、実際の反映作業を Kanban タスクとして起票・実行する方針を説明してください。
 その Kanban 作業には Life repo の knowledge/ への反映、index 更新、log 記録、lint、commit、push の要件を含め、Discord ボタンの同期処理として直接ファイルを書き込まないでください。
