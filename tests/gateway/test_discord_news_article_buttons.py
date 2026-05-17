@@ -12,6 +12,7 @@ from gateway.platforms.discord import (
     THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE,
     THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT,
     ThreadLifecycleView,
+    WikiProposalDecisionView,
 )
 
 
@@ -268,8 +269,8 @@ async def test_wiki_button_dispatches_proposal_only_life_knowledge_request():
     async def send_message(content, **kwargs):
         calls.append(("send_message", content, kwargs))
 
-    async def dispatch_agent_request(interaction, text):
-        calls.append(("dispatch", interaction, text))
+    async def dispatch_agent_request(interaction, text, metadata=None):
+        calls.append(("dispatch", interaction, text, metadata))
 
     view._thread = thread_for_interaction
     view._dispatch_agent_request = dispatch_agent_request
@@ -285,7 +286,87 @@ async def test_wiki_button_dispatches_proposal_only_life_knowledge_request():
         THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE,
         {"ephemeral": True},
     )
-    assert calls[1] == ("dispatch", interaction, THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT)
+    assert calls[1] == (
+        "dispatch",
+        interaction,
+        THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT,
+        {"wiki_proposal": True, "thread_lifecycle_buttons": False},
+    )
+
+
+@pytest.mark.skipif(not DISCORD_AVAILABLE, reason="discord.py is not installed")
+def test_wiki_proposal_metadata_attaches_decision_view_instead_of_lifecycle_view():
+    config = PlatformConfig(enabled=True, token="***")
+    adapter = DiscordAdapter(config)
+    channel = object.__new__(__import__("discord").Thread)
+
+    view = adapter._build_message_action_view(
+        channel,
+        {"wiki_proposal": True, "thread_lifecycle_buttons": False},
+    )
+
+    assert isinstance(view, WikiProposalDecisionView)
+    assert [getattr(child, "label", None) for child in view.children] == ["Save", "Edit", "Skip"]
+
+
+@pytest.mark.skipif(not DISCORD_AVAILABLE, reason="discord.py is not installed")
+@pytest.mark.asyncio
+async def test_wiki_proposal_save_routes_followup_without_direct_file_write():
+    calls = []
+
+    async def dispatch_agent_request(interaction, text, metadata=None):
+        calls.append(("dispatch", text, metadata))
+
+    async def defer(**kwargs):
+        calls.append(("defer", kwargs))
+
+    async def followup_send(content, **kwargs):
+        calls.append(("followup", content, kwargs))
+
+    view = WikiProposalDecisionView(adapter=SimpleNamespace(), allowed_user_ids=set())
+    view._dispatch_agent_request = dispatch_agent_request
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123, display_name="hiro"),
+        message=SimpleNamespace(content="Status: proposal only; no files have been changed yet.\n保存候補あり"),
+        response=SimpleNamespace(defer=defer),
+        followup=SimpleNamespace(send=followup_send),
+    )
+
+    await view._save_candidate_action(interaction)
+
+    assert calls[0] == ("defer", {"ephemeral": True, "thinking": False})
+    assert calls[1][0] == "followup"
+    assert "保存タスク" in calls[1][1]
+    assert calls[2][0] == "dispatch"
+    assert "この Wiki 候補を保存反映する Kanban タスク" in calls[2][1]
+    assert "同期処理として直接ファイルを書き込まない" in calls[2][1]
+    assert calls[2][2] == {"thread_lifecycle_buttons": False}
+
+
+@pytest.mark.skipif(not DISCORD_AVAILABLE, reason="discord.py is not installed")
+@pytest.mark.asyncio
+async def test_wiki_proposal_skip_is_harmless_and_explicit():
+    calls = []
+
+    async def defer(**kwargs):
+        calls.append(("defer", kwargs))
+
+    async def followup_send(content, **kwargs):
+        calls.append(("followup", content, kwargs))
+
+    view = WikiProposalDecisionView(adapter=SimpleNamespace(), allowed_user_ids=set())
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123, display_name="hiro"),
+        response=SimpleNamespace(defer=defer),
+        followup=SimpleNamespace(send=followup_send),
+    )
+
+    await view._skip_candidate_action(interaction)
+
+    assert calls == [
+        ("defer", {"ephemeral": True, "thinking": False}),
+        ("followup", "Skipしました。ファイルは変更してません〜", {"ephemeral": True}),
+    ]
 
 
 def test_wiki_proposal_prompt_is_save_edit_skip_candidate_flow():
