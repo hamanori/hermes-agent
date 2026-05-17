@@ -5317,7 +5317,7 @@ def _component_check_auth(
 
 
 THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE = (
-    "📚 Wiki保存候補だけ作りますね〜 まだファイルは変更しません。Save/Edit/Skipで選べる形にします。"
+    "📚 Wiki候補を作りますね〜 まだ書き込みません。Save/Edit/Skipで選べる形にします。"
 )
 
 THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT = """このスレッド全体を読んで、Life repo の knowledge/ に保存する候補を proposal-only で作ってください。
@@ -5326,18 +5326,26 @@ THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT = """このスレッド全体を読んで�
 必ず出力に次の行を含めてください:
 Status: proposal only; no files have been changed yet.
 
-保存不要なら保存不要と理由を返してください。
-既存の Life 方針として、#ideas を Issue intake として扱わないでください。
-
-出力には次の項目を含めてください:
+保存不要なら「保存不要」と明記し、保存しない理由だけを返してください。
+保存候補がある場合だけ、次の項目をすべて含めてください:
 - 保存判定
 - 理由
-- 推奨保存先（raw/concepts/entities/comparisons/queries/preferences/保存しない のいずれか）
+- 推奨保存先（raw/articles, concepts, entities, comparisons, queries, preferences, 保存しない のいずれか）
 - 新規作成or既存ページ更新候補
 - 保存本文案の要約
 - hiro確認事項
-- 次の操作ボタン: Save/Edit/Skip（表示文言は Save / Edit / Skip でもよい）
+- 次の操作案: Save/Edit/Skip（表示文言は Save / Edit / Skip でもよい）
 
+推奨保存先の分類基準:
+- raw/articles: 外部記事・一次情報・長めの引用元を原資料として残す候補
+- concepts: 再利用できる考え方・運用方針・判断軸
+- entities: 人物・組織・サービス・場所などの固有対象
+- comparisons: 複数候補の比較、選定理由、トレードオフ
+- queries: 後で再実行したい調査クエリや検索条件
+- preferences: hiro の長期的な好み・生活/運用上の優先順位
+- 保存しない: 一時的、既存知識と重複、または保存価値が薄い内容
+
+既存の Life 方針として、#ideas を Issue intake として扱わないでください。
 Save が選ばれた場合だけ、実際の反映作業を Kanban タスクとして起票・実行する方針を説明してください。
 その Kanban 作業には Life repo の knowledge/ への反映、index 更新、log 記録、lint、commit、push の要件を含め、Discord ボタンの同期処理として直接ファイルを書き込まないでください。
 """
