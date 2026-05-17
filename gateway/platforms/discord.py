@@ -5720,6 +5720,27 @@ if DISCORD_AVAILABLE:
                 "このスレッドの内容をアイデアとして整理して、必要なら #ideas に送るべきか判断してください。",
             )
 
+        def _wiki_proposal_ack_message(self) -> str:
+            return "📚 llm-wiki 保存提案を作りますね〜。まだ書き込みません。"
+
+        def _wiki_proposal_request(self) -> str:
+            return (
+                "このスレッドの内容を llm-wiki に残すべきか、proposal-only の保存提案として整理してください。"
+                "この段階では絶対にファイルを書き込まないでください。\n\n"
+                "出力には次の見出しを必ず含めてください:\n"
+                "- 保存判定\n"
+                "- 理由\n"
+                "- 推奨保存先\n"
+                "- 新規/既存ページ候補\n"
+                "- 本文案要約\n"
+                "- hiro確認事項\n"
+                "- Status: proposal only; no files have been changed yet.\n\n"
+                "最後に次のアクションを one-word labels として提示してください: Save / Edit / Skip。"
+                "Save が選ばれた場合だけ、実際の反映作業を Kanban タスクとして起票・実行する方針を説明してください。"
+                "その Kanban 作業には Life repo の knowledge/ への反映、index 更新、log 記録、lint、commit、push の要件を含め、"
+                "Discord ボタンの同期処理として直接ファイルを書き込まないでください。"
+            )
+
         @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="📚", custom_id="thread_lifecycle_wiki", row=1)
         async def wiki_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
             if await self._deny_if_unauthorized(interaction):
@@ -5727,10 +5748,10 @@ if DISCORD_AVAILABLE:
             thread = await self._thread(interaction)
             if not thread:
                 return
-            await interaction.response.send_message("📚 llm-wiki 候補に入れますね〜", ephemeral=True)
+            await interaction.response.send_message(self._wiki_proposal_ack_message(), ephemeral=True)
             await self._dispatch_agent_request(
                 interaction,
-                "このスレッドの内容を llm-wiki に書き込む候補として整理してください。知識として残すべき要点、再利用できる事実、注意点を抽出してください。",
+                self._wiki_proposal_request(),
             )
 
         @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="🧾", custom_id="thread_lifecycle_summary", row=1)

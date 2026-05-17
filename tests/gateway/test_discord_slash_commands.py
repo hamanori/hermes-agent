@@ -899,6 +899,57 @@ def test_thread_lifecycle_view_can_be_suppressed_by_metadata(adapter):
     ) is None
 
 
+def test_thread_lifecycle_wiki_proposal_copy_is_proposal_only(adapter):
+    thread_channel = _FakeThreadChannel()
+    view = adapter._build_thread_lifecycle_view(thread_channel)
+
+    ack = view._wiki_proposal_ack_message()
+    request = view._wiki_proposal_request()
+
+    assert "まだ書き込みません" in ack
+    assert "proposal only; no files have been changed yet" in request
+    for heading in [
+        "保存判定",
+        "理由",
+        "推奨保存先",
+        "新規/既存ページ候補",
+        "本文案要約",
+        "hiro確認事項",
+    ]:
+        assert heading in request
+    assert "Save" in request
+    assert "Edit" in request
+    assert "Skip" in request
+    assert "one-word labels" in request
+    assert "ファイルを書き込まない" in request
+    assert "Kanban" in request
+    for requirement in ["knowledge/", "index", "log", "lint", "commit", "push"]:
+        assert requirement in request
+
+
+@pytest.mark.asyncio
+async def test_thread_lifecycle_wiki_button_sends_proposal_only_request(adapter):
+    thread_channel = _FakeThreadChannel()
+    view = adapter._build_thread_lifecycle_view(thread_channel)
+    view._dispatch_agent_request = AsyncMock()
+    interaction = SimpleNamespace(
+        channel=thread_channel,
+        user=SimpleNamespace(id=42, display_name="Hiro"),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    await view.wiki_thread(interaction, None)
+
+    interaction.response.send_message.assert_awaited_once_with(
+        view._wiki_proposal_ack_message(),
+        ephemeral=True,
+    )
+    view._dispatch_agent_request.assert_awaited_once_with(
+        interaction,
+        view._wiki_proposal_request(),
+    )
+
+
 @pytest.mark.asyncio
 async def test_todo_card_text_trigger_sends_card_without_slash_sync(adapter, monkeypatch):
     """Text trigger should provide the TODO modal hint even when Discord slash sync is delayed."""
