@@ -13,6 +13,7 @@ from gateway.platforms.discord import (
     THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT,
     ThreadLifecycleView,
     WikiProposalDecisionView,
+    WikiProposalEditModal,
 )
 
 
@@ -367,6 +368,69 @@ async def test_wiki_proposal_skip_is_harmless_and_explicit():
         ("defer", {"ephemeral": True, "thinking": False}),
         ("followup", "Skipしました。ファイルは変更してません〜", {"ephemeral": True}),
     ]
+
+
+@pytest.mark.skipif(not DISCORD_AVAILABLE, reason="discord.py is not installed")
+@pytest.mark.asyncio
+async def test_wiki_proposal_edit_opens_modal_without_dispatching_generic_request():
+    calls = []
+
+    async def dispatch_agent_request(interaction, text, metadata=None):
+        calls.append(("dispatch", text, metadata))
+
+    async def send_modal(modal):
+        calls.append(("modal", modal))
+
+    view = WikiProposalDecisionView(adapter=SimpleNamespace(), allowed_user_ids=set())
+    view._dispatch_agent_request = dispatch_agent_request
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123, display_name="hiro"),
+        message=SimpleNamespace(content="Status: proposal only; no files have been changed yet.\n保存候補あり"),
+        response=SimpleNamespace(send_modal=send_modal),
+    )
+
+    await view._edit_candidate_action(interaction)
+
+    assert len(calls) == 1
+    assert calls[0][0] == "modal"
+    assert isinstance(calls[0][1], WikiProposalEditModal)
+
+
+@pytest.mark.skipif(not DISCORD_AVAILABLE, reason="discord.py is not installed")
+@pytest.mark.asyncio
+async def test_wiki_proposal_edit_modal_dispatches_guided_revised_proposal():
+    calls = []
+
+    async def dispatch_agent_request(interaction, text, metadata=None):
+        calls.append(("dispatch", text, metadata))
+
+    async def defer(**kwargs):
+        calls.append(("defer", kwargs))
+
+    async def followup_send(content, **kwargs):
+        calls.append(("followup", content, kwargs))
+
+    view = WikiProposalDecisionView(adapter=SimpleNamespace(), allowed_user_ids=set())
+    view._dispatch_agent_request = dispatch_agent_request
+    modal = WikiProposalEditModal(view)
+    modal.guidance.default = "preferences ではなく concepts に寄せて、本文案を短くする"
+    modal.guidance._value = "preferences ではなく concepts に寄せて、本文案を短くする"
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123, display_name="hiro"),
+        message=SimpleNamespace(content="Status: proposal only; no files have been changed yet.\n元候補"),
+        response=SimpleNamespace(defer=defer),
+        followup=SimpleNamespace(send=followup_send),
+    )
+
+    await modal.on_submit(interaction)
+
+    assert calls[0] == ("defer", {"ephemeral": True, "thinking": False})
+    assert calls[1][0] == "followup"
+    assert "Edit指示を反映" in calls[1][1]
+    assert calls[2][0] == "dispatch"
+    assert "preferences ではなく concepts" in calls[2][1]
+    assert "Status: proposal only; no files have been changed yet." in calls[2][1]
+    assert calls[2][2] == {"wiki_proposal": True, "thread_lifecycle_buttons": False}
 
 
 def test_wiki_proposal_prompt_is_save_edit_skip_candidate_flow():
