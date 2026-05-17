@@ -9,6 +9,8 @@ from gateway.platforms.discord import (
     DISCORD_AVAILABLE,
     DiscordAdapter,
     NewsArticleFeedbackView,
+    THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE,
+    THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT,
     ThreadLifecycleView,
 )
 
@@ -252,3 +254,60 @@ async def test_resume_button_dispatches_continuation_request():
     assert calls[2] == ("followup", "🔄 続きから応答します〜", {"ephemeral": True})
     assert calls[3][0] == "dispatch"
     assert "止まっていた続きの応答をしてください" in calls[3][2]
+
+
+@pytest.mark.skipif(not DISCORD_AVAILABLE, reason="discord.py is not installed")
+@pytest.mark.asyncio
+async def test_wiki_button_dispatches_proposal_only_life_knowledge_request():
+    view = ThreadLifecycleView(adapter=SimpleNamespace(), allowed_user_ids=set())
+    calls = []
+
+    async def thread_for_interaction(_interaction):
+        return SimpleNamespace(name="学びの整理")
+
+    async def send_message(content, **kwargs):
+        calls.append(("send_message", content, kwargs))
+
+    async def dispatch_agent_request(interaction, text):
+        calls.append(("dispatch", interaction, text))
+
+    view._thread = thread_for_interaction
+    view._dispatch_agent_request = dispatch_agent_request
+    interaction = SimpleNamespace(
+        user=SimpleNamespace(id=123, display_name="hiro"),
+        response=SimpleNamespace(send_message=send_message),
+    )
+
+    await view._wiki_thread_action(interaction)
+
+    assert calls[0] == (
+        "send_message",
+        THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE,
+        {"ephemeral": True},
+    )
+    assert calls[1] == ("dispatch", interaction, THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT)
+
+
+def test_wiki_proposal_prompt_is_save_edit_skip_candidate_flow():
+    assert THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE == (
+        "📚 Wiki保存候補だけ作りますね〜 まだファイルは変更しません。Save/Edit/Skipで選べる形にします。"
+    )
+    prompt = THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT
+    assert "このスレッド全体を読んで" in prompt
+    assert "Life repo の knowledge/ に保存する候補" in prompt
+    assert "まだファイルは変更しない" in prompt
+    assert "Status: proposal only; no files have been changed yet." in prompt
+    assert "保存不要なら保存不要と理由" in prompt
+    assert "#ideas を Issue intake として扱わない" in prompt
+    assert "Wiki は直接書き込みではなく候補作成" in prompt
+    assert "Save/Edit/Skip" in prompt
+    for required_heading in [
+        "保存判定",
+        "理由",
+        "推奨保存先",
+        "新規作成or既存ページ更新候補",
+        "保存本文案の要約",
+        "hiro確認事項",
+        "次の操作ボタン",
+    ]:
+        assert required_heading in prompt
