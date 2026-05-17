@@ -961,6 +961,11 @@ class MessageEvent:
     # from ``text`` so the sender-prefix logic in run.py can operate on the
     # trigger message alone, then prepend this context afterward.
     channel_context: Optional[str] = None
+
+    # Per-event delivery metadata to merge into outgoing responses generated
+    # from this synthetic/user event.  Platform button flows use this to attach
+    # response-scoped views without changing the session source.
+    metadata: Optional[Dict[str, Any]] = None
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
@@ -3042,6 +3047,8 @@ class BasePlatformAdapter(ABC):
         
         # Start continuous typing indicator (refreshes every 2 seconds)
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        if event.metadata:
+            _thread_metadata = {**(_thread_metadata or {}), **event.metadata}
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
             _keep_typing_sig = inspect.signature(self._keep_typing)
