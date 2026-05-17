@@ -5316,6 +5316,30 @@ def _component_check_auth(
     return False
 
 
+THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE = (
+    "📚 Wiki保存候補だけ作りますね〜 まだファイルは変更しません。Save/Edit/Skipで選べる形にします。"
+)
+
+THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT = """このスレッド全体を読んで、Life repo の knowledge/ に保存する候補を作ってください。
+まだファイルは変更しないでください。Wiki は直接書き込みではなく候補作成です。
+
+必ず出力に次の行を含めてください:
+Status: proposal only; no files have been changed yet.
+
+保存不要なら保存不要と理由を返してください。
+既存の Life 方針として、#ideas を Issue intake として扱わないでください。
+
+出力には次の項目を含めてください:
+- 保存判定
+- 理由
+- 推奨保存先（raw/concepts/entities/comparisons/queries/preferences/保存しない のいずれか）
+- 新規作成or既存ページ更新候補
+- 保存本文案の要約
+- hiro確認事項
+- 次の操作ボタン: Save/Edit/Skip
+"""
+
+
 if DISCORD_AVAILABLE:
 
     class NewsArticleFeedbackView(discord.ui.View):
@@ -5690,18 +5714,18 @@ if DISCORD_AVAILABLE:
                 "このスレッドの内容をアイデアとして整理して、必要なら #ideas に送るべきか判断してください。",
             )
 
-        @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="📚", custom_id="thread_lifecycle_wiki", row=1)
-        async def wiki_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def _wiki_thread_action(self, interaction: discord.Interaction) -> None:
             if await self._deny_if_unauthorized(interaction):
                 return
             thread = await self._thread(interaction)
             if not thread:
                 return
-            await interaction.response.send_message("📚 llm-wiki 候補に入れますね〜", ephemeral=True)
-            await self._dispatch_agent_request(
-                interaction,
-                "このスレッドの内容を llm-wiki に書き込む候補として整理してください。知識として残すべき要点、再利用できる事実、注意点を抽出してください。",
-            )
+            await interaction.response.send_message(THREAD_LIFECYCLE_WIKI_EPHEMERAL_MESSAGE, ephemeral=True)
+            await self._dispatch_agent_request(interaction, THREAD_LIFECYCLE_WIKI_PROPOSAL_PROMPT)
+
+        @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="📚", custom_id="thread_lifecycle_wiki", row=1)
+        async def wiki_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._wiki_thread_action(interaction)
 
         @discord.ui.button(style=discord.ButtonStyle.secondary, emoji="🧾", custom_id="thread_lifecycle_summary", row=1)
         async def summarize_thread(self, interaction: discord.Interaction, button: discord.ui.Button):
