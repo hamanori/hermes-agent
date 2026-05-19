@@ -3149,6 +3149,64 @@ def test_legacy_db_without_skills_column_migrates(tmp_path):
     conn.close()
 
 
+def test_legacy_db_without_session_id_column_connects(tmp_path):
+    """connect() must not create the session_id index before migration."""
+    import sqlite3
+    db_path = tmp_path / "legacy-session-id.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER DEFAULT 0,
+            created_by TEXT,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER,
+            tenant TEXT,
+            result TEXT,
+            idempotency_key TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            worker_pid INTEGER,
+            last_failure_error TEXT,
+            max_runtime_seconds INTEGER,
+            last_heartbeat_at INTEGER,
+            current_run_id INTEGER,
+            workflow_template_id TEXT,
+            current_step_key TEXT,
+            skills TEXT,
+            max_retries INTEGER,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        cols = {row["name"] for row in migrated.execute("PRAGMA table_info(tasks)")}
+        assert "session_id" in cols
+        indexes = {
+            row["name"]
+            for row in migrated.execute("PRAGMA index_list(tasks)")
+        }
+        assert "idx_tasks_session_id" in indexes
+
+
 def test_legacy_spawn_failure_columns_are_copied_not_renamed(tmp_path):
     """Legacy failure counters survive migration without fragile column renames."""
     import sqlite3
