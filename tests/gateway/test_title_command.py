@@ -632,16 +632,19 @@ async def test_schedule_discord_thread_title_update_ignores_stale_completion(mon
         assistant_response="second response",
         agent_messages=[],
     )
+    assert first_task.cancelling() > 0
     await asyncio.wait_for(second_task, timeout=1)
     release_first.set()
-    await asyncio.wait_for(first_task, timeout=1)
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(first_task, timeout=1)
 
-    session_db.set_session_title.assert_called_once_with("session-1", "Second Turn Title")
+    session_db.set_session_title.assert_not_called()
     adapter.update_thread_title.assert_awaited_once_with(
         "777",
         "Second Turn Title",
         user_message="second turn",
     )
+    assert ("discord", "777") not in runner._discord_thread_title_tasks
 
 
 @pytest.mark.asyncio
@@ -650,7 +653,8 @@ async def test_schedule_discord_thread_title_update_serializes_in_flight_renames
 
     calls = []
     first_rename_started = asyncio.Event()
-    second_rename_finished = asyncio.Event()
+    first_rename_finished = asyncio.Event()
+    second_rename_started = asyncio.Event()
     release_first_rename = asyncio.Event()
 
     async def update_thread_title(_thread_id, title, *, user_message):
@@ -658,9 +662,12 @@ async def test_schedule_discord_thread_title_update_serializes_in_flight_renames
         if title == "First Turn Title":
             first_rename_started.set()
             await release_first_rename.wait()
-        calls.append(("finish", title))
         if title == "Second Turn Title":
-            second_rename_finished.set()
+            second_rename_started.set()
+            assert first_rename_finished.is_set(), "newer rename started while an older rename was still in flight"
+        calls.append(("finish", title))
+        if title == "First Turn Title":
+            first_rename_finished.set()
         return True
 
     adapter = SimpleNamespace(update_thread_title=AsyncMock(side_effect=update_thread_title))
@@ -699,15 +706,12 @@ async def test_schedule_discord_thread_title_update_serializes_in_flight_renames
         assistant_response="second response",
         agent_messages=[],
     )
-    try:
-        await asyncio.wait_for(second_rename_finished.wait(), timeout=0.2)
-    except asyncio.TimeoutError:
-        pass
-    else:
-        pytest.fail("newer rename finished while an older rename was still in flight")
 
+    await asyncio.sleep(0)
+    assert not second_rename_started.is_set()
     release_first_rename.set()
-    await asyncio.wait_for(asyncio.gather(first_task, second_task), timeout=1)
+    await asyncio.wait_for(first_task, timeout=1)
+    await asyncio.wait_for(second_task, timeout=1)
 
     assert calls == [
         ("start", "First Turn Title"),
@@ -715,7 +719,95 @@ async def test_schedule_discord_thread_title_update_serializes_in_flight_renames
         ("start", "Second Turn Title"),
         ("finish", "Second Turn Title"),
     ]
-    assert session_db.set_session_title.call_args_list[-1].args == ("session-1", "Second Turn Title")
+    session_db.set_session_title.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_schedule_discord_thread_title_update_cancels_existing_thread_task(monkeypatch):
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._background_tasks = set()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_update(**kwargs):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(runner, "_maybe_update_discord_thread_title", slow_update)
+    source_a = SessionSource(platform=Platform.DISCORD, chat_id="parent", chat_type="thread", thread_id="777")
+    source_b = SessionSource(platform=Platform.DISCORD, chat_id="parent", chat_type="thread", thread_id="777")
+
+    first_task = runner._schedule_discord_thread_title_update(
+        source=source_a,
+        session_id="session-1",
+        user_message="first turn",
+        assistant_response="first response",
+        agent_messages=[],
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    second_task = runner._schedule_discord_thread_title_update(
+        source=source_b,
+        session_id="session-2",
+        user_message="second turn",
+        assistant_response="second response",
+        agent_messages=[],
+    )
+
+    assert first_task.cancelling() > 0
+    assert runner._discord_thread_title_tasks[("discord", "777")] is second_task
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(first_task, timeout=1)
+    await asyncio.wait_for(second_task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_maybe_update_discord_thread_title_rechecks_latest_task_before_rename(monkeypatch, caplog):
+    from gateway.run import GatewayRunner
+    import gateway.run as gateway_run
+    import threading
+
+    adapter = SimpleNamespace(update_thread_title=AsyncMock(return_value=True))
+    session_db = MagicMock()
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._session_db = session_db
+    runner._discord_thread_title_tasks = {}
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_generate_title(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=2), "timed out waiting to release generator"
+        return "Stale Thread Title"
+
+    monkeypatch.setattr("agent.title_generator.generate_title", fake_generate_title)
+    caplog.set_level("INFO", logger=gateway_run.logger.name)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="parent", chat_type="thread", thread_id="777")
+
+    task = asyncio.create_task(
+        runner._maybe_update_discord_thread_title(
+            source=source,
+            session_id="session-1",
+            user_message="first turn",
+            assistant_response="first response",
+            agent_messages=[],
+        )
+    )
+    runner._discord_thread_title_tasks[("discord", "777")] = task
+    await asyncio.wait_for(asyncio.to_thread(started.wait, 1), timeout=1)
+    replacement = asyncio.create_task(asyncio.sleep(0))
+    runner._discord_thread_title_tasks[("discord", "777")] = replacement
+    release.set()
+    await asyncio.wait_for(task, timeout=1)
+    await replacement
+
+    session_db.set_session_title.assert_not_called()
+    adapter.update_thread_title.assert_not_awaited()
+    assert "reason=stale_task_before_rename" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -745,7 +837,7 @@ async def test_maybe_update_discord_thread_title_calls_adapter_when_title_genera
         agent_messages=[],
     )
 
-    session_db.set_session_title.assert_called_once_with("session-1", "Discordスレ名仕様")
+    session_db.set_session_title.assert_not_called()
     adapter.update_thread_title.assert_awaited_once_with(
         "777",
         "Discordスレ名仕様",
@@ -783,7 +875,7 @@ async def test_maybe_update_discord_thread_title_logs_adapter_false(monkeypatch,
         agent_messages=[],
     )
 
-    session_db.set_session_title.assert_called_once_with("session-1", "Discordスレ名更新")
+    session_db.set_session_title.assert_not_called()
     adapter.update_thread_title.assert_awaited_once_with("777", "Discordスレ名更新", user_message="Discordのスレ名を直して")
     assert "reason=adapter_returned_false" in caplog.text
     assert "title='Discordスレ名更新'" in caplog.text
