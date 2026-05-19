@@ -5059,6 +5059,43 @@ def _hermes_path_argv(path: str) -> list[str]:
     return [_absolute_hermes_path(path)]
 
 
+def _merge_hermes_dotenv_into_child_env(env: dict[str, str], hermes_home: str | os.PathLike | None) -> None:
+    """Merge a Hermes profile ``.env`` into a worker child env in-place.
+
+    Kanban workers are spawned with a profile-scoped ``HERMES_HOME`` so the
+    Hermes CLI can load the assignee's config. The parent dispatcher may be a
+    long-lived daemon that does not have the assignee profile's credentials in
+    its own process environment, so copying ``os.environ`` alone is not enough
+    for subprocesses/tools launched by the worker. Load the target profile's
+    dotenv file before ``Popen`` so those subprocesses inherit the same secrets
+    the Hermes profile would read at startup.
+    """
+    if not hermes_home:
+        return
+    env_path = Path(hermes_home) / ".env"
+    if not env_path.exists():
+        return
+    try:
+        from dotenv import dotenv_values
+    except Exception:
+        return
+    try:
+        from hermes_cli.env_loader import _sanitize_env_file_if_needed
+        _sanitize_env_file_if_needed(env_path)
+    except Exception:
+        pass
+    try:
+        values = dotenv_values(dotenv_path=env_path, encoding="utf-8")
+    except UnicodeDecodeError:
+        values = dotenv_values(dotenv_path=env_path, encoding="latin-1")
+    for key, value in values.items():
+        if not key or value is None:
+            continue
+        if any(key.endswith(suffix) for suffix in ("_API_KEY", "_TOKEN", "_SECRET", "_KEY")):
+            value = value.encode("ascii", errors="ignore").decode("ascii")
+        env[str(key)] = str(value)
+
+
 def _resolve_hermes_argv() -> list[str]:
     """Resolve the ``hermes`` invocation as argv parts for ``Popen``.
 
@@ -5212,6 +5249,7 @@ def _default_spawn(
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+    _merge_hermes_dotenv_into_child_env(env, env.get("HERMES_HOME"))
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id

@@ -41,6 +41,26 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Worker spawn environment
+# ---------------------------------------------------------------------------
+
+def test_worker_child_env_loads_profile_dotenv(tmp_path):
+    profile_home = tmp_path / "profiles" / "analyst"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").write_text(
+        "DISCORD_BOT_TOKEN=profile-token\n"
+        "PLAIN_VALUE=from-profile\n",
+        encoding="utf-8",
+    )
+    env = {"DISCORD_BOT_TOKEN": "stale-parent"}
+
+    kb._merge_hermes_dotenv_into_child_env(env, str(profile_home))
+
+    assert env["DISCORD_BOT_TOKEN"] == "profile-token"
+    assert env["PLAIN_VALUE"] == "from-profile"
+
+
+# ---------------------------------------------------------------------------
 # Idempotency key
 # ---------------------------------------------------------------------------
 
