@@ -164,8 +164,8 @@ def test_recompute_ready_cascades_through_chain(kanban_home):
         assert kb.get_task(conn, c).status == "ready"
 
 
-def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
-    """blocked tasks with all parents done should be promoted to ready."""
+def test_recompute_ready_leaves_blocked_tasks_blocked(kanban_home):
+    """blocked tasks require explicit unblock even when all parents are done."""
     with kb.connect() as conn:
         parent = kb.create_task(conn, title="parent", assignee="a")
         child = kb.create_task(
@@ -183,9 +183,15 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         )
         conn.commit()
         assert kb.get_task(conn, child).status == "blocked"
-        # recompute_ready should promote blocked → ready and reset failures
+        # recompute_ready must not auto-unblock a worker/human blocked task.
         promoted = kb.recompute_ready(conn)
-        assert promoted == 1
+        assert promoted == 0
+        task = kb.get_task(conn, child)
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 5
+        assert task.last_failure_error == "persistent error"
+
+        assert kb.unblock_task(conn, child)
         task = kb.get_task(conn, child)
         assert task.status == "ready"
         assert task.consecutive_failures == 0
@@ -462,7 +468,7 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
             )
 
 
-def test_max_runtime_uses_current_run_start_after_retry(kanban_home):
+def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch):
     """A retry should get a fresh max-runtime window.
 
     ``tasks.started_at`` intentionally records the first time the task ever
@@ -470,6 +476,7 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home):
     ``task_runs.started_at`` row; otherwise every retry of an old task is
     immediately timed out again.
     """
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
     with kb.connect() as conn:
         host = kb._claimer_id().split(":", 1)[0]
         t = kb.create_task(

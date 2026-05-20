@@ -2006,11 +2006,16 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
+
+    ``blocked`` tasks are intentionally excluded. A blocked worker has
+    asked for human input, credentials, or another explicit intervention;
+    dependency resolution must not auto-unblock it just because its parents
+    are already done.
     """
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status FROM tasks WHERE status IN ('todo', 'blocked')"
+            "SELECT id, status FROM tasks WHERE status = 'todo'"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
@@ -2022,20 +2027,10 @@ def recompute_ready(conn: sqlite3.Connection) -> int:
                 (task_id,),
             ).fetchall()
             if all(p["status"] in ("done", "archived") for p in parents):
-                # Blocked tasks also get their failure counters reset —
-                # this is effectively an auto-unblock.
-                if cur_status == "blocked":
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready', "
-                        "consecutive_failures = 0, last_failure_error = NULL "
-                        "WHERE id = ? AND status = 'blocked'",
-                        (task_id,),
-                    )
-                else:
-                    conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
-                    )
+                conn.execute(
+                    "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                    (task_id,),
+                )
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
