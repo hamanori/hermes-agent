@@ -55,6 +55,17 @@ def _create_completed_subscription(summary="done once"):
         conn.close()
 
 
+def _create_blocked_subscription(reason):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="blocked notify", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(conn, tid, reason=reason)
+        return tid
+    finally:
+        conn.close()
+
+
 def _unseen_terminal_events(tid):
     conn = kb.connect()
     try:
@@ -120,6 +131,44 @@ def test_kanban_notifier_rewinds_claim_if_adapter_disconnects(tmp_path, monkeypa
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+
+def test_kanban_notifier_mentions_hiro_for_user_action_required_block(tmp_path, monkeypatch):
+    db_path = tmp_path / "user-action-required-block.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_blocked_subscription(
+        "user-action-required: YouTube dedicated profile is signed out."
+    )
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert text.startswith("<@739715021029769277>\n")
+    assert f"Kanban {tid} blocked" in text
+    assert "YouTube dedicated profile is signed out." in text
+    assert "user-action-required" not in text
+
+
+def test_kanban_notifier_does_not_mention_hiro_for_normal_block(tmp_path, monkeypatch):
+    db_path = tmp_path / "normal-block.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_blocked_subscription("Waiting for upstream quota window.")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    text = adapter.sent[0]["text"]
+    assert not text.startswith("<@739715021029769277>")
+    assert text == f"⏸ @worker Kanban {tid} blocked: Waiting for upstream quota window."
 
 
 def test_kanban_db_path_is_test_isolated_from_real_home():

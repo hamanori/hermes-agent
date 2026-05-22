@@ -4699,10 +4699,16 @@ class GatewayRunner:
                                 f" — {title}{handoff}"
                             )
                         elif kind == "blocked":
+                            mention = ""
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
+                                reason_text = str(ev.payload["reason"]).strip()
+                                marker = "user-action-required:"
+                                if reason_text.lower().startswith(marker):
+                                    mention = "<@739715021029769277>\n"
+                                    reason_text = reason_text[len(marker):].strip()
+                                reason = f": {reason_text[:160]}" if reason_text else ""
+                            msg = f"{mention}⏸ {tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
