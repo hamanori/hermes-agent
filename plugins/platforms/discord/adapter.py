@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import struct
 import subprocess
 import tempfile
@@ -626,6 +627,16 @@ class DiscordAdapter(BasePlatformAdapter):
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
         self._last_self_message_id: Dict[str, str] = {}
+        # Persistent Discord UI views must be registered once per adapter
+        # process after on_ready fires.  Initialize the guards before connect()
+        # installs the on_ready closure so startup cannot trip over missing
+        # attributes when lifecycle/news buttons are enabled.
+        self._thread_lifecycle_persistent_view_registered = False
+        self._news_article_persistent_view_registered = False
+        self._outing_feedback_persistent_view_registered = False
+        self._wiki_proposal_persistent_view_registered = False
+        self._todoist_classifier = None
+        self._todoist_client_cls = None
 
     async def connect(self) -> bool:
         """Connect to Discord and start receiving events."""
@@ -749,6 +760,30 @@ class DiscordAdapter(BasePlatformAdapter):
                 # Resolve any usernames in the allowed list to numeric IDs
                 await adapter_self._resolve_allowed_usernames()
                 adapter_self._ready_event.set()
+
+                if not adapter_self._news_article_persistent_view_registered:
+                    try:
+                        adapter_self._client.add_view(
+                            NewsArticleFeedbackView(
+                                adapter=adapter_self,
+                                allowed_user_ids=adapter_self._allowed_user_ids,
+                            )
+                        )
+                        adapter_self._news_article_persistent_view_registered = True
+                    except Exception as e:
+                        logger.debug("Could not register Discord article feedback persistent view: %s", e)
+
+                if not adapter_self._outing_feedback_persistent_view_registered:
+                    try:
+                        adapter_self._client.add_view(
+                            OutingFeedbackView(
+                                adapter=adapter_self,
+                                allowed_user_ids=adapter_self._allowed_user_ids,
+                            )
+                        )
+                        adapter_self._outing_feedback_persistent_view_registered = True
+                    except Exception as e:
+                        logger.debug("Could not register Discord outing feedback persistent view: %s", e)
 
                 if adapter_self._post_connect_task and not adapter_self._post_connect_task.done():
                     adapter_self._post_connect_task.cancel()
@@ -5256,7 +5291,342 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, NewsArticleFeedbackView, OutingFeedbackView
+
+    class NewsArticleFeedbackView(discord.ui.View):
+        """Persistent feedback controls for Life news and Intelligence article posts."""
+
+        FEEDBACK_REACTIONS = {
+            "read": "✅",
+            "keep": "⭐",
+            "skip": "👎",
+            "deep": "🧵",
+            "save": "💾",
+        }
+
+        CUSTOM_IDS = {
+            "read": "intelligence_article_read",
+            "keep": "intelligence_article_more",
+            "skip": "intelligence_article_shallow",
+            "deep": "intelligence_article_deep",
+            "save": "intelligence_article_save",
+        }
+
+        def __init__(self, allowed_user_ids: set, adapter=None):
+            super().__init__(timeout=None)
+            self.allowed_user_ids = allowed_user_ids
+            self.adapter = adapter
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            if not self.allowed_user_ids:
+                return True
+            return str(interaction.user.id) in self.allowed_user_ids
+
+        async def _deny_if_unauthorized(self, interaction: discord.Interaction) -> bool:
+            if self._check_auth(interaction):
+                return False
+            await interaction.response.send_message("このボタンを使う権限がないみたいです〜", ephemeral=True)
+            return True
+
+        def _extract_article_url(self, message) -> str | None:
+            content = getattr(message, "content", "") or ""
+            urls = re.findall(r"https?://[^\s)]+", content)
+            if urls:
+                return urls[0].rstrip('>.,)"]}')
+            embeds = getattr(message, "embeds", None) or []
+            for embed in embeds:
+                url = getattr(embed, "url", None)
+                if url:
+                    return str(url)
+            return None
+
+        def _persist_news_feedback(self, interaction: discord.Interaction, key: str, label: str, emoji: str) -> None:
+            try:
+                from datetime import datetime, timezone
+                from hermes_constants import get_hermes_home
+
+                state_dir = get_hermes_home() / "state"
+                state_dir.mkdir(parents=True, exist_ok=True)
+                log_path = state_dir / "news_feedback.jsonl"
+                message = getattr(interaction, "message", None)
+                channel = getattr(interaction, "channel", None)
+                record = {
+                    "ts": datetime.now(timezone.utc).isoformat(),
+                    "reaction": key,
+                    "reaction_label": label,
+                    "reaction_emoji": emoji,
+                    "custom_id": self.CUSTOM_IDS.get(key) or f"news_article_{key}",
+                    "feedback_scope": "article" if label in {"読んだ", "もっとこの系統", "浅い/つまらない", "追調査して", "保存"} else "link",
+                    "guild_id": str(getattr(getattr(interaction, "guild", None), "id", "") or ""),
+                    "channel_id": str(getattr(channel, "id", "") or ""),
+                    "thread_id": str(getattr(channel, "id", "") or "") if isinstance(channel, discord.Thread) else None,
+                    "message_id": str(getattr(message, "id", "") or ""),
+                    "user_id": str(getattr(getattr(interaction, "user", None), "id", "") or ""),
+                    "user_name": getattr(getattr(interaction, "user", None), "display_name", None),
+                    "article_url": self._extract_article_url(message) if message else None,
+                    "article_title": getattr(message, "content", "")[:500] if message else None,
+                }
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception:
+                logger.exception("Failed to persist article feedback event")
+
+        async def _mark(self, interaction: discord.Interaction, key: str, label: str) -> None:
+            if await self._deny_if_unauthorized(interaction):
+                return
+            message = getattr(interaction, "message", None)
+            if message is None:
+                await interaction.response.send_message("対象の記事メッセージが見つかりませんでした〜", ephemeral=True)
+                return
+
+            await interaction.response.defer(ephemeral=True, thinking=False)
+            emoji = self.FEEDBACK_REACTIONS[key]
+            try:
+                await message.add_reaction(emoji)
+                self._persist_news_feedback(interaction, key, label, emoji)
+                await interaction.followup.send(f"{emoji} {label} として記録しました〜", ephemeral=True)
+            except Exception as exc:
+                await interaction.followup.send(f"記録に失敗しました: {exc}", ephemeral=True)
+
+        async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+            logger.exception("Article feedback button failed: item=%s", item, exc_info=error)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("ボタン処理でエラーになりました〜", ephemeral=True)
+            else:
+                await interaction.followup.send("ボタン処理でエラーになりました〜", ephemeral=True)
+
+        @discord.ui.button(label="読んだ", style=discord.ButtonStyle.green, emoji="✅", custom_id="intelligence_article_read")
+        async def read_intelligence_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "read", "読んだ")
+
+        @discord.ui.button(label="もっとこの系統", style=discord.ButtonStyle.blurple, emoji="⭐", custom_id="intelligence_article_more")
+        async def more_intelligence_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "keep", "もっとこの系統")
+
+        @discord.ui.button(label="浅い/つまらない", style=discord.ButtonStyle.grey, emoji="👎", custom_id="intelligence_article_shallow")
+        async def shallow_intelligence_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "skip", "浅い/つまらない")
+
+        @discord.ui.button(label="追調査して", style=discord.ButtonStyle.blurple, emoji="🧵", custom_id="intelligence_article_deep")
+        async def deep_intelligence_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "deep", "追調査して")
+
+        @discord.ui.button(label="保存", style=discord.ButtonStyle.green, emoji="💾", custom_id="intelligence_article_save")
+        async def save_intelligence_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "save", "保存")
+
+        @discord.ui.button(label="Read", style=discord.ButtonStyle.green, emoji="✅", custom_id="news_article_read")
+        async def read_news_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "read", "Read")
+
+        @discord.ui.button(label="More", style=discord.ButtonStyle.blurple, emoji="⭐", custom_id="news_article_keep")
+        async def keep_news_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "keep", "More")
+
+        @discord.ui.button(label="Less", style=discord.ButtonStyle.grey, emoji="👎", custom_id="news_article_skip")
+        async def skip_news_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "skip", "Less")
+
+        @discord.ui.button(label="Deep Dive", style=discord.ButtonStyle.grey, emoji="🧵", custom_id="news_article_deep")
+        async def deep_news_article(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "deep", "Deep Dive")
+
+    class OutingFeedbackView(discord.ui.View):
+        """Persistent feedback controls for Life Outings posts."""
+
+        DEFAULT_DB = "/Users/hamanori/.hermes/state/outings/outings.sqlite3"
+        LIFE_REPO_DIR = "/Users/hamanori/Development/Life"
+
+        FEEDBACK_REACTIONS = {
+            "want_to_go": "🙋",
+            "interested": "⭐",
+            "not_for_me": "👎",
+            "research_more": "🧵",
+            "schedule_candidate": "🗓️",
+        }
+
+        CUSTOM_IDS = {
+            "want_to_go": "outing_want_to_go",
+            "interested": "outing_interested",
+            "not_for_me": "outing_not_for_me",
+            "research_more": "outing_research_more",
+            "schedule_candidate": "outing_schedule_candidate",
+        }
+
+        def __init__(self, allowed_user_ids: set, adapter=None):
+            super().__init__(timeout=None)
+            self.allowed_user_ids = allowed_user_ids
+            self.adapter = adapter
+
+        def _check_auth(self, interaction: discord.Interaction) -> bool:
+            if not self.allowed_user_ids:
+                return True
+            return str(interaction.user.id) in self.allowed_user_ids
+
+        async def _deny_if_unauthorized(self, interaction: discord.Interaction) -> bool:
+            if self._check_auth(interaction):
+                return False
+            await interaction.response.send_message("このボタンを使う権限がないみたいです〜", ephemeral=True)
+            return True
+
+        def _db_path(self) -> str:
+            return os.getenv("HERMES_OUTINGS_DB") or self.DEFAULT_DB
+
+        def _find_publication(self, message_id: str) -> tuple[int | None, int | None]:
+            con = sqlite3.connect(self._db_path())
+            try:
+                con.row_factory = sqlite3.Row
+                row = con.execute(
+                    """
+                    SELECT id, metadata_json
+                    FROM outing_publications
+                    WHERE discord_message_id=?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (message_id,),
+                ).fetchone()
+                if row is None:
+                    return None, None
+                metadata = json.loads(row["metadata_json"] or "{}")
+                item_id = metadata.get("item_id")
+                return int(row["id"]), int(item_id) if item_id is not None else None
+            finally:
+                con.close()
+
+        def _persist_outing_feedback(
+            self,
+            interaction: discord.Interaction,
+            key: str,
+            label: str,
+            emoji: str,
+            *,
+            item_id: int | None,
+            publication_id: int | None,
+            result: dict[str, Any] | None = None,
+        ) -> None:
+            con = sqlite3.connect(self._db_path())
+            try:
+                metadata = {
+                    "custom_id": self.CUSTOM_IDS[key],
+                    "reaction_label": label,
+                    "reaction_emoji": emoji,
+                    "guild_id": str(getattr(getattr(interaction, "guild", None), "id", "") or ""),
+                    "channel_id": str(getattr(getattr(interaction, "channel", None), "id", "") or ""),
+                    "message_id": str(getattr(getattr(interaction, "message", None), "id", "") or ""),
+                    "user_id": str(getattr(getattr(interaction, "user", None), "id", "") or ""),
+                    "user_name": getattr(getattr(interaction, "user", None), "display_name", None),
+                }
+                if result is not None:
+                    metadata["result"] = result
+                con.execute(
+                    """
+                    INSERT INTO outing_feedback_events(
+                      item_id, publication_id, feedback_type, actor, created_at, todoist_task_id, metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, datetime('now'), ?, ?)
+                    """,
+                    (
+                        item_id,
+                        publication_id,
+                        key,
+                        "hiro",
+                        str((result or {}).get("todoist_task_id") or "") or None,
+                        json.dumps(metadata, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+        async def _run_schedule_candidate(self, item_id: int) -> dict[str, Any]:
+            cmd = [
+                sys.executable,
+                str(_Path(self.LIFE_REPO_DIR) / "scripts" / "outing_feedback.py"),
+                "--db",
+                self._db_path(),
+                "--item-id",
+                str(item_id),
+                "--json",
+            ]
+
+            def _run() -> dict[str, Any]:
+                completed = subprocess.run(
+                    cmd,
+                    cwd=self.LIFE_REPO_DIR,
+                    text=True,
+                    capture_output=True,
+                    timeout=30,
+                    check=False,
+                )
+                if completed.returncode != 0:
+                    raise RuntimeError((completed.stderr or completed.stdout or "").strip())
+                return json.loads(completed.stdout or "{}")
+
+            return await asyncio.to_thread(_run)
+
+        async def _mark(self, interaction: discord.Interaction, key: str, label: str) -> None:
+            if await self._deny_if_unauthorized(interaction):
+                return
+            message = getattr(interaction, "message", None)
+            if message is None:
+                await interaction.response.send_message("対象のおでかけ投稿が見つかりませんでした〜", ephemeral=True)
+                return
+
+            await interaction.response.defer(ephemeral=True, thinking=False)
+            emoji = self.FEEDBACK_REACTIONS[key]
+            publication_id, item_id = self._find_publication(str(getattr(message, "id", "") or ""))
+            if publication_id is None:
+                await interaction.followup.send("対象のおでかけ投稿をDBで見つけられませんでした〜", ephemeral=True)
+                return
+
+            try:
+                await message.add_reaction(emoji)
+                result = None
+                if key == "schedule_candidate":
+                    if item_id is None:
+                        raise RuntimeError("Outings publication has no item_id metadata")
+                    result = await self._run_schedule_candidate(item_id)
+                else:
+                    self._persist_outing_feedback(
+                        interaction,
+                        key,
+                        label,
+                        emoji,
+                        item_id=item_id,
+                        publication_id=publication_id,
+                    )
+                await interaction.followup.send(f"{emoji} {label} として記録しました〜", ephemeral=True)
+            except Exception as exc:
+                logger.exception("Outing feedback button failed")
+                await interaction.followup.send(f"記録に失敗しました: {exc}", ephemeral=True)
+
+        async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
+            logger.exception("Outing feedback button failed: item=%s", item, exc_info=error)
+            if not interaction.response.is_done():
+                await interaction.response.send_message("ボタン処理でエラーになりました〜", ephemeral=True)
+            else:
+                await interaction.followup.send("ボタン処理でエラーになりました〜", ephemeral=True)
+
+        @discord.ui.button(label="行きたい", style=discord.ButtonStyle.green, emoji="🙋", custom_id="outing_want_to_go")
+        async def want_to_go(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "want_to_go", "行きたい")
+
+        @discord.ui.button(label="気になる", style=discord.ButtonStyle.blurple, emoji="⭐", custom_id="outing_interested")
+        async def interested(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "interested", "気になる")
+
+        @discord.ui.button(label="微妙", style=discord.ButtonStyle.grey, emoji="👎", custom_id="outing_not_for_me")
+        async def not_for_me(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "not_for_me", "微妙")
+
+        @discord.ui.button(label="詳細調査", style=discord.ButtonStyle.blurple, emoji="🧵", custom_id="outing_research_more")
+        async def research_more(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "research_more", "詳細調査")
+
+        @discord.ui.button(label="予定候補", style=discord.ButtonStyle.green, emoji="🗓️", custom_id="outing_schedule_candidate")
+        async def schedule_candidate(self, interaction: discord.Interaction, button: discord.ui.Button):
+            await self._mark(interaction, "schedule_candidate", "予定候補")
 
     class ExecApprovalView(discord.ui.View):
         """
