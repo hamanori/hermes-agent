@@ -158,6 +158,29 @@ SILENT_MARKER = "[SILENT]"
 _hermes_home: Path | None = None
 
 
+def _normalize_repetition_unit(text: str) -> str:
+    return "".join(text.strip().split())
+
+
+def _dedupe_adjacent_repeated_lines(content: str) -> str:
+    """Collapse exact adjacent duplicate lines in high-frequency mumble output."""
+    lines = content.splitlines()
+    deduped: list[str] = []
+    previous_norm = ""
+    for line in lines:
+        norm = _normalize_repetition_unit(line)
+        if norm and norm == previous_norm:
+            continue
+        deduped.append(line)
+        previous_norm = norm if norm else ""
+    return "\n".join(deduped)
+
+
+def _sanitize_cron_final_response(job: dict, content: str) -> str:
+    if job.get("id") != "7fe4d99fd75d" and job.get("name") != "hermes-random-mumble":
+        return content
+    return _dedupe_adjacent_repeated_lines(content)
+
 def _get_hermes_home() -> Path:
     """Resolve Hermes home dynamically while preserving test monkeypatch hooks."""
     return _hermes_home or get_hermes_home()
@@ -1765,6 +1788,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
             raise RuntimeError(_err_text)
 
         final_response = result.get("final_response", "") or ""
+        final_response = _sanitize_cron_final_response(job, final_response)
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""

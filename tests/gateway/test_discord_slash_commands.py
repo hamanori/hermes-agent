@@ -76,6 +76,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord import adapter as discord_platform  # noqa: E402
 
 
 class FakeTree:
@@ -156,6 +157,227 @@ async def test_registers_native_restart_slash_command(adapter):
         "/restart",
         "Restart requested~",
     )
+
+
+@pytest.mark.asyncio
+async def test_registers_native_todo_slash_command_with_text_only(adapter):
+    adapter._run_todo_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "todo" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["todo"](
+        interaction,
+        text="牛乳を買う",
+    )
+
+    adapter._run_todo_slash.assert_awaited_once_with(
+        interaction,
+        text="牛乳を買う",
+    )
+
+
+@pytest.mark.asyncio
+async def test_registers_native_chatgpt_pro_slash_command(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "chatgpt-pro" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["chatgpt-pro"](
+        interaction,
+        prompt="この案をレビューして",
+    )
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction,
+        "/chatgpt-pro この案をレビューして",
+    )
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_pro_slash_without_prompt_sends_usage_hint(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+
+    await adapter._client.tree.commands["chatgpt-pro"](
+        interaction,
+        prompt="",
+    )
+
+    interaction.response.send_message.assert_awaited_once_with(
+        "何を Pro extended thinking で考えさせる？",
+        ephemeral=True,
+    )
+    adapter._run_simple_slash.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_registers_native_chatgpt_research_slash_command(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    assert "chatgpt-research" in adapter._client.tree.commands
+
+    interaction = SimpleNamespace()
+    await adapter._client.tree.commands["chatgpt-research"](
+        interaction,
+        prompt="競合サービスを調べて",
+    )
+
+    adapter._run_simple_slash.assert_awaited_once_with(
+        interaction,
+        "/chatgpt-research 競合サービスを調べて",
+    )
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_research_slash_without_prompt_sends_usage_hint(adapter):
+    adapter._run_simple_slash = AsyncMock()
+    adapter._register_slash_commands()
+
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+
+    await adapter._client.tree.commands["chatgpt-research"](
+        interaction,
+        prompt=" ",
+    )
+
+    interaction.response.send_message.assert_awaited_once_with(
+        "何を Deep Research で調べる？範囲や出力形式もあれば教えて",
+        ephemeral=True,
+    )
+    adapter._run_simple_slash.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_todo_slash_without_text_sends_usage_hint(adapter):
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=AsyncMock()))
+
+    await adapter._run_todo_slash(interaction, text="")
+
+    interaction.response.send_message.assert_awaited_once()
+    _, kwargs = interaction.response.send_message.await_args
+    assert kwargs == {"ephemeral": True}
+
+
+def test_classify_todoist_text_uses_injected_classifier(adapter):
+    adapter._todoist_classifier = lambda text: [
+        SimpleNamespace(title=text, project_key="shopping", section="food", due=None, note="")
+    ]
+
+    items = adapter._classify_todoist_text("牛乳を買う")
+
+    assert items == [{
+        "title": "牛乳を買う",
+        "project_key": "shopping",
+        "project": "🛒 shopping",
+        "section": "food",
+        "due": "",
+        "note": "",
+    }]
+
+
+def test_build_todoist_preview_message_shows_add_cancel_flow(adapter):
+    items = [{
+        "title": "牛乳を買う",
+        "project": "🛒 shopping",
+        "section": "food",
+        "due": "明日",
+        "note": "来客用",
+    }]
+
+    message = adapter._build_todoist_preview_message(items)
+
+    assert "Todoistに追加する前の確認" in message
+    assert "牛乳を買う" in message
+    assert "Actions: Add / Cancel" in message
+
+
+@pytest.mark.asyncio
+async def test_todoist_preview_view_includes_dropdowns_and_updates_items(adapter, monkeypatch):
+    class FakeSelectOption:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeView:
+        def __init__(self, *args, **kwargs):
+            self.children = []
+
+        def add_item(self, item):
+            self.children.append(item)
+
+        def clear_items(self):
+            self.children.clear()
+
+    class FakeSelect:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.callback = None
+
+    class FakeButton:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            self.callback = None
+
+    fake_discord = SimpleNamespace(
+        ui=SimpleNamespace(View=FakeView, Select=FakeSelect, Button=FakeButton),
+        SelectOption=FakeSelectOption,
+        ButtonStyle=SimpleNamespace(success=1, danger=2),
+        Interaction=object,
+    )
+    monkeypatch.setattr(discord_platform, "discord", fake_discord)
+    items = [{
+        "title": "牛乳を買う",
+        "project_key": "general",
+        "project": "📦 general",
+        "section": "",
+        "due": "",
+        "note": "",
+    }]
+
+    view = adapter._build_todoist_preview_view(items, "牛乳を買う")
+
+    assert [getattr(child, "placeholder", getattr(child, "label", "")) for child in view.children] == [
+        "カテゴリ",
+        "セクション",
+        "期限",
+        "Add",
+        "Cancel",
+    ]
+
+    interaction = SimpleNamespace(data={"values": ["shopping"]}, response=SimpleNamespace(edit_message=AsyncMock()))
+    await view.children[0].callback(interaction)
+
+    assert items[0]["project_key"] == "shopping"
+    assert items[0]["project"] == "🛒 shopping"
+    interaction.response.edit_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_todo_slash_with_text_sends_preview_without_dispatch(adapter):
+    interaction = SimpleNamespace(
+        response=SimpleNamespace(defer=AsyncMock()),
+        channel=SimpleNamespace(send=AsyncMock()),
+        edit_original_response=AsyncMock(),
+    )
+    adapter._classify_todoist_text = MagicMock(return_value=[
+        {"title": "牛乳を買う", "project_key": "shopping", "project": "🛒 shopping", "section": "food", "due": "", "note": ""}
+    ])
+    adapter._build_todoist_preview_view = MagicMock(return_value="VIEW")
+    adapter.handle_message = AsyncMock()
+
+    await adapter._run_todo_slash(interaction, text="牛乳を買う")
+
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+    interaction.channel.send.assert_awaited_once()
+    adapter._build_todoist_preview_view.assert_called_once()
+    adapter.handle_message.assert_not_awaited()
+    interaction.edit_original_response.assert_awaited_once_with(content="Todoist追加前の確認を表示しました。")
 
 
 # ------------------------------------------------------------------
@@ -623,6 +845,7 @@ class _FakeTextChannel:
         self.name = name
         self.guild = SimpleNamespace(name=guild_name, id=1)
         self.topic = None
+        self.send = AsyncMock()
 
     def history(self, *args, **kwargs):
         async def _empty():
@@ -662,6 +885,64 @@ def _fake_message(channel, *, content="Hello", author_id=42, display_name="Jezza
         created_at=None,
         id=12345,
     )
+
+
+def test_thread_lifecycle_view_only_builds_for_threads(adapter):
+    text_channel = _FakeTextChannel()
+    thread_channel = _FakeThreadChannel()
+
+    assert adapter._build_thread_lifecycle_view(text_channel) is None
+    view = adapter._build_thread_lifecycle_view(thread_channel)
+
+    assert view is not None
+    assert getattr(view, "timeout", None) is None
+    assert getattr(view, "adapter", None) is adapter
+
+
+def test_thread_lifecycle_view_can_be_suppressed_by_metadata(adapter):
+    thread_channel = _FakeThreadChannel()
+
+    assert adapter._build_thread_lifecycle_view(
+        thread_channel,
+        {"thread_lifecycle_buttons": False},
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_todo_card_text_trigger_sends_card_without_slash_sync(adapter, monkeypatch):
+    """Text trigger should provide the TODO modal hint even when Discord slash sync is delayed."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+    channel = _FakeTextChannel()
+    msg = _fake_message(channel, content="todoカード")
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_message(msg)
+
+    channel.send.assert_awaited_once()
+    args, kwargs = channel.send.await_args
+    assert "追加したい内容" in args[0]
+    assert kwargs == {}
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_todo_text_trigger_sends_create_modal_hint(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    monkeypatch.delenv("DISCORD_ALLOWED_CHANNELS", raising=False)
+    channel = _FakeTextChannel()
+    msg = _fake_message(channel, content="todo")
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_message(msg)
+
+    channel.send.assert_awaited_once()
+    args, kwargs = channel.send.await_args
+    assert "追加したい内容" in args[0]
+    assert kwargs == {}
+    adapter.handle_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -994,4 +1275,3 @@ def test_register_skill_command_autocomplete_filters_by_name_and_description(ada
     # (covered in other tests). The autocomplete filter itself is exercised
     # via direct function call in the real-discord integration path.
     assert skill_cmd.callback is not None
-
