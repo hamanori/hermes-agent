@@ -2117,6 +2117,57 @@ def test_list_runs_filters_by_outcome_value(kanban_home):
     assert not empty
 
 
+def test_list_runs_accepts_iso_timestamp_rows(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="alice")
+        task = kb.claim_task(conn, tid)
+        run_id = task.current_run_id
+        assert run_id is not None
+        conn.execute(
+            """
+            UPDATE task_runs
+            SET started_at=?, ended_at=?
+            WHERE id=?
+            """,
+            (
+                "2026-06-05T06:39:05.932016+00:00",
+                "2026-06-05T06:40:05.932016+00:00",
+                run_id,
+            ),
+        )
+        conn.commit()
+        runs = kb.list_runs(conn, tid)
+
+    assert len(runs) == 1
+    assert isinstance(runs[0].started_at, int)
+    assert isinstance(runs[0].ended_at, int)
+
+
+def test_get_task_accepts_iso_timestamp_rows(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="t", assignee="alice")
+        conn.execute(
+            """
+            UPDATE tasks
+            SET created_at=?, started_at=?, completed_at=?
+            WHERE id=?
+            """,
+            (
+                "2026-06-05T06:39:05.932016+00:00",
+                "2026-06-05T06:40:05.932016+00:00",
+                None,
+                tid,
+            ),
+        )
+        conn.commit()
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    assert isinstance(task.created_at, int)
+    assert isinstance(task.started_at, int)
+    assert task.completed_at is None
+
+
 def test_tenant_propagates_to_events(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="tenant-task", tenant="biz-a")

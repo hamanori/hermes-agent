@@ -182,6 +182,47 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_show_handles_iso_run_timestamps(worker_env):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        conn.execute(
+            """
+            UPDATE task_runs
+            SET started_at=?, ended_at=?
+            WHERE task_id=?
+            """,
+            (
+                "2026-06-05T06:39:05.932016+00:00",
+                "2026-06-05T06:40:05.932016+00:00",
+                worker_env,
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+            SET created_at=?, started_at=?, completed_at=?
+            WHERE id=?
+            """,
+            (
+                "2026-06-05T06:38:05.932016+00:00",
+                "2026-06-05T06:39:05.932016+00:00",
+                None,
+                worker_env,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_show({})
+    d = json.loads(out)
+    assert "error" not in d
+    assert d["task"]["id"] == worker_env
+    assert d["runs"]
+
+
 def test_show_explicit_task_id(worker_env):
     """Peek at a different task than the one in env."""
     from hermes_cli import kanban_db as kb
