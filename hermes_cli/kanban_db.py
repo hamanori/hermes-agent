@@ -7334,10 +7334,17 @@ def task_age(task: Task) -> dict:
     _c = _to_epoch(task.created_at)
     _s = _to_epoch(task.started_at)
     _co = _to_epoch(task.completed_at)
+    if _c is not None and _c <= 0:
+        _c = None
+    if _s is not None and _s <= 0:
+        _s = None
+    if _co is not None and _co <= 0:
+        _co = None
     age_since_created = now - _c if _c is not None else None
     age_since_started = now - _s if _s is not None else None
+    anchor = _s if _s is not None else _c
     time_to_complete = (
-        _co - (_s or _c) if _co is not None else None
+        _co - anchor if _co is not None and anchor is not None else None
     )
     return {
         "created_age_seconds": age_since_created,
