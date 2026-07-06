@@ -225,8 +225,11 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
     except ImportError:
         return channels
 
+    allowed_channels = _discord_allowed_channels(adapter)
     for guild in client.guilds:
         for ch in guild.text_channels:
+            if allowed_channels is not None and str(ch.id) not in allowed_channels:
+                continue
             channels.append({
                 "id": str(ch.id),
                 "name": ch.name,
@@ -236,6 +239,8 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
         # Forum channels (type 15) — creating a message auto-spawns a thread post.
         forums = getattr(guild, "forum_channels", None) or []
         for ch in forums:
+            if allowed_channels is not None and str(ch.id) not in allowed_channels:
+                continue
             channels.append({
                 "id": str(ch.id),
                 "name": ch.name,
@@ -245,8 +250,15 @@ def _build_discord(adapter) -> List[Dict[str, str]]:
         # Also include DM-capable users we've interacted with is not
         # feasible via guild enumeration; those come from sessions.
 
-    # Merge any DMs from session history
-    channels.extend(_build_from_sessions("discord"))
+    # Merge any DMs/threads from session history, but keep Discord directory
+    # consistent with the operator's channel allowlist.
+    session_entries = _build_from_sessions("discord")
+    if allowed_channels is not None:
+        session_entries = [
+            entry for entry in session_entries
+            if str(entry.get("id", "")).split(":", 1)[0] in allowed_channels
+        ]
+    channels.extend(session_entries)
     return channels
 
 
@@ -291,6 +303,23 @@ def _normalize_adapter_channels(raw_channels: Any) -> List[Dict[str, Any]]:
         channels.append(entry)
         seen_ids.add(channel_id)
     return channels
+
+
+def _discord_allowed_channels(adapter) -> Optional[set[str]]:
+    """Return configured Discord channel allowlist, or None when unrestricted."""
+    raw = getattr(getattr(adapter, "config", None), "extra", {}).get("allowed_channels")
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, str):
+        values = [item.strip() for item in raw.split(",")]
+    elif isinstance(raw, (list, tuple, set)):
+        values = [str(item).strip() for item in raw]
+    else:
+        values = [str(raw).strip()]
+    allowed = {item for item in values if item}
+    if "*" in allowed:
+        return None
+    return allowed
 
 
 async def _build_slack(adapter) -> List[Dict[str, Any]]:
